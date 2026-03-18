@@ -11,12 +11,14 @@ PDF ──→ [Stage 1] 전처리 (텍스트 + 이미지 분리 추출)
            │
            ├─→ [Stage 2] 텍스트 전체 분석 (API 1회)
            │
-           ├─→ [Stage 3] Figure/Table 개별 분석 (API N회)
+           ├─→ [Stage 3] Figure/Table 개별 분석 (API N회, 병렬 4개)
            │      └─ 각 이미지 + caption + 본문 문맥을 함께 전달
            │
            └─→ [Stage 4] 종합 (API 1회)
                    └─ 텍스트 분석 + Figure 분석 교차 검증 → 최종 보고서
 ```
+
+각 Stage 완료 시 중간 결과가 캐시 파일로 저장되어, 중단 후 `--resume`으로 재개 가능합니다.
 
 ### 왜 이 방식이 더 정확한가?
 
@@ -33,13 +35,28 @@ PDF ──→ [Stage 1] 전처리 (텍스트 + 이미지 분리 추출)
 # 1. 의존성 설치
 pip install -r requirements.txt
 
-# 2. API 키 설정
-export ANTHROPIC_API_KEY='sk-ant-api03-...'
+# 2. API 키 설정 (.env 파일 사용 — Git에 커밋되지 않음)
+cp .env.example .env
+# .env 파일을 열어 실제 API 키를 입력하세요
 ```
 
 ## 사용법
 
-### 기본 실행 (한국어, Sonnet 4.6)
+### 🌐 웹 UI (Streamlit) — 추천
+
+터미널 없이 브라우저에서 모든 것을 할 수 있습니다:
+
+```bash
+streamlit run app.py
+```
+
+브라우저가 자동으로 열리면:
+1. 왼쪽 사이드바에 **API Key** 입력
+2. **논문 PDF 업로드**
+3. **분석 시작** 버튼 클릭
+4. 완료 후 결과 확인 & **다운로드**
+
+### 💻 CLI (터미널)
 
 ```bash
 python analyze_paper.py paper.pdf
@@ -62,6 +79,12 @@ python analyze_paper.py paper.pdf --text-only
 
 # 이미지 최대 분석 수 제한
 python analyze_paper.py paper.pdf --max-images 10
+
+# 중단된 분석 재개 (캐시 활용)
+python analyze_paper.py paper.pdf --resume
+
+# 캐시 무시하고 처음부터 분석
+python analyze_paper.py paper.pdf --no-cache
 ```
 
 ### 출력 예시
