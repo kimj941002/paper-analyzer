@@ -302,21 +302,31 @@ class PaperAnalyzer:
         messages: list[dict],
         max_tokens: int = MAX_OUTPUT_TOKENS,
     ) -> str:
-        """Claude API 호출 (재시도 로직 포함)"""
+        """Claude API 호출 — 스트리밍 모드 (재시도 로직 포함)"""
         for attempt in range(3):
             try:
-                response = self.client.messages.create(
+                result_chunks: list[str] = []
+                input_tokens = 0
+                output_tokens = 0
+
+                with self.client.messages.stream(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=messages,
-                )
-                usage = response.usage
-                with self._token_lock:
-                    self.result.token_usage["input_tokens"] += usage.input_tokens
-                    self.result.token_usage["output_tokens"] += usage.output_tokens
+                ) as stream:
+                    for text in stream.text_stream:
+                        result_chunks.append(text)
 
-                return response.content[0].text
+                resp = stream.get_final_message()
+                input_tokens = resp.usage.input_tokens
+                output_tokens = resp.usage.output_tokens
+
+                with self._token_lock:
+                    self.result.token_usage["input_tokens"] += input_tokens
+                    self.result.token_usage["output_tokens"] += output_tokens
+
+                return "".join(result_chunks)
 
             except anthropic.RateLimitError:
                 wait = 2 ** attempt * 10
