@@ -25,6 +25,13 @@ from analyze_paper import (
     IMAGE_MAX_COUNT,
 )
 
+# Google Drive 저장 모듈 (선택적 — 미설치 시 비활성)
+try:
+    from drive_storage import DriveStorage
+    DRIVE_AVAILABLE = True
+except ImportError:
+    DRIVE_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # 페이지 설정
 # ─────────────────────────────────────────────
@@ -87,6 +94,40 @@ with st.sidebar:
         value=IMAGE_MAX_COUNT,
         disabled=text_only,
     )
+
+    st.divider()
+
+    # ── Google Drive 저장 설정 ──
+    st.subheader("☁️ Google Drive 저장")
+
+    if DRIVE_AVAILABLE:
+        enable_drive = st.checkbox("분석 완료 후 Drive에 자동 저장")
+        if enable_drive:
+            drive_creds_path = st.text_input(
+                "Service Account JSON 경로",
+                value=os.environ.get("GDRIVE_CREDENTIALS", ""),
+                help="Google Cloud 서비스 계정 키 파일 경로 (.json)",
+            )
+            drive_folder_id = st.text_input(
+                "루트 폴더 ID",
+                value=os.environ.get("GDRIVE_FOLDER_ID", ""),
+                help="Paper-Analysis-DB 폴더의 Google Drive ID",
+            )
+            drive_sheet_id = st.text_input(
+                "인덱스 Sheets ID",
+                value=os.environ.get("GDRIVE_SHEET_ID", ""),
+                help="인덱스용 Google Sheets 문서 ID",
+            )
+            drive_tags = st.text_input(
+                "태그 (쉼표 구분)",
+                placeholder="ML, NLP, Transformer",
+            )
+        else:
+            drive_creds_path = drive_folder_id = drive_sheet_id = drive_tags = ""
+    else:
+        enable_drive = False
+        drive_creds_path = drive_folder_id = drive_sheet_id = drive_tags = ""
+        st.caption("_비활성: `pip install gspread google-api-python-client google-auth` 필요_")
 
     st.divider()
 
@@ -241,6 +282,34 @@ if uploaded_file and st.button("🚀 분석 시작", type="primary", use_contain
             mime="text/markdown",
             use_container_width=True,
         )
+
+        # ── Google Drive 저장 ──
+        if enable_drive and drive_creds_path and drive_folder_id and drive_sheet_id:
+            st.divider()
+            with st.status("☁️ Google Drive에 저장 중...", expanded=True) as drive_status:
+                try:
+                    storage = DriveStorage(
+                        credentials_path=drive_creds_path,
+                        root_folder_id=drive_folder_id,
+                        sheet_id=drive_sheet_id,
+                    )
+                    save_result = storage.save(
+                        pdf_path=tmp_path,
+                        analysis_md=output_md,
+                        result=analyzer.result,
+                        model=model,
+                        lang=lang,
+                        cost=cost,
+                        tags=drive_tags,
+                    )
+                    st.write(f"✅ 저장 완료 — [Drive 폴더 열기]({save_result['folder_link']})")
+                    drive_status.update(label="☁️ Google Drive 저장 완료 ✅", state="complete")
+                except FileNotFoundError:
+                    st.error("❌ Service Account JSON 파일을 찾을 수 없습니다. 경로를 확인하세요.")
+                    drive_status.update(label="☁️ Drive 저장 실패", state="error")
+                except Exception as e:
+                    st.error(f"❌ Drive 저장 중 오류: {e}")
+                    drive_status.update(label="☁️ Drive 저장 실패", state="error")
 
     finally:
         # 임시 파일 정리
