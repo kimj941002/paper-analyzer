@@ -42,7 +42,21 @@ cp .env.example .env
 
 ## 사용법
 
-### 기본 실행 (한국어, Sonnet 4.6)
+### 🌐 웹 UI (Streamlit) — 추천
+
+터미널 없이 브라우저에서 모든 것을 할 수 있습니다:
+
+```bash
+streamlit run app.py
+```
+
+브라우저가 자동으로 열리면:
+1. 왼쪽 사이드바에 **API Key** 입력
+2. **논문 PDF 업로드**
+3. **분석 시작** 버튼 클릭
+4. 완료 후 결과 확인 & **다운로드**
+
+### 💻 CLI (터미널)
 
 ```bash
 python analyze_paper.py paper.pdf
