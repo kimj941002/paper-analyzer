@@ -35,8 +35,9 @@ PDF ──→ [Stage 1] 전처리 (텍스트 + 이미지 분리 추출)
 # 1. 의존성 설치
 pip install -r requirements.txt
 
-# 2. API 키 설정
-export ANTHROPIC_API_KEY='sk-ant-api03-...'
+# 2. API 키 설정 (.env 파일 사용 — Git에 커밋되지 않음)
+cp .env.example .env
+# .env 파일을 열어 실제 API 키를 입력하세요
 ```
 
 ## 사용법

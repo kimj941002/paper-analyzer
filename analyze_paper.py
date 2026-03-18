@@ -28,6 +28,9 @@ from pathlib import Path
 
 import anthropic
 import fitz  # PyMuPDF
+from dotenv import load_dotenv
+
+load_dotenv()  # .env 파일에서 환경변수 로드
 
 # ─────────────────────────────────────────────
 # 설정 (Configuration)
