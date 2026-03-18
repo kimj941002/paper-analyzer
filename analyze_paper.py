@@ -21,9 +21,10 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import anthropic
 import fitz  # PyMuPDF
@@ -38,6 +39,14 @@ SYNTHESIS_MAX_TOKENS = 32000       # 종합 단계는 더 길게
 IMAGE_MIN_SIZE = (80, 80)          # 최소 이미지 크기 (px) — 로고/아이콘 제외
 IMAGE_MAX_COUNT = 30               # 최대 추출 이미지 수
 IMAGE_DPI = 200                    # 이미지 렌더링 해상도
+FIGURE_CONCURRENCY = 4             # Figure 병렬 분석 수
+
+# 모델별 비용 ($/MTok) — input, output
+MODEL_PRICING = {
+    "sonnet": (3, 15),
+    "opus":   (15, 75),
+    "haiku":  (0.25, 1.25),
+}
 
 # ─────────────────────────────────────────────
 # 데이터 구조
@@ -54,6 +63,7 @@ class ExtractedImage:
     height: int
     caption: str = ""
     context: str = ""  # 본문에서 해당 figure를 언급하는 문맥
+    figure_number: str = ""  # 매칭된 Figure/Table 번호 (예: "1", "2A")
 
 
 @dataclass
@@ -70,6 +80,7 @@ class AnalysisResult:
     text_analysis: str = ""
     figure_analyses: list[dict] = field(default_factory=list)
     synthesis: str = ""
+    model: str = ""
     token_usage: dict = field(default_factory=lambda: {
         "input_tokens": 0, "output_tokens": 0
     })
@@ -102,10 +113,6 @@ def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> Extrac
     result.full_text = "\n\n".join(page_texts)
 
     # ── 이미지 추출 ──
-    #    방법 1: 페이지 렌더링 기반 (figure 전체를 캡처하기 위해)
-    #    방법 2: 내장 이미지 직접 추출
-    #    → 두 방법을 병행하되, 내장 이미지 추출을 우선 사용
-
     images = _extract_embedded_images(doc)
 
     # 내장 이미지가 적으면 페이지 렌더링 방식도 시도
@@ -169,8 +176,6 @@ def _extract_page_renders(doc: fitz.Document) -> list[ExtractedImage]:
     """각 페이지를 이미지로 렌더링 (내장 이미지 추출이 실패한 경우 fallback)"""
     images = []
     for page_num, page in enumerate(doc):
-        # Figure가 있을 법한 페이지만 렌더링 (텍스트 비율로 판단)
-        text = page.get_text("text")
         blocks = page.get_text("dict")["blocks"]
         image_blocks = [b for b in blocks if b.get("type") == 1]
 
@@ -194,8 +199,22 @@ def _extract_page_renders(doc: fitz.Document) -> list[ExtractedImage]:
     return images
 
 
+def _get_page_text(full_text: str, page_num: int) -> str:
+    """전체 텍스트에서 특정 페이지의 텍스트를 추출"""
+    marker = f"[Page {page_num}]"
+    start = full_text.find(marker)
+    if start == -1:
+        return ""
+    end = full_text.find("[Page", start + 1)
+    return full_text[start:end] if end != -1 else full_text[start:]
+
+
 def _match_captions(result: ExtractionResult):
-    """Figure/Table caption을 이미지에 매칭하고, 본문 문맥 추출"""
+    """Figure/Table caption을 이미지에 매칭하고, 본문 문맥 추출
+
+    매칭 전략: 각 이미지가 위치한 페이지(±1)에서 발견되는 캡션을 순서대로 매칭.
+    캡션의 figure 번호를 이미지에 기록하여, 본문 문맥 검색 시 정확한 번호를 사용.
+    """
     text = result.full_text
 
     # Figure/Table 캡션 패턴
@@ -203,47 +222,51 @@ def _match_captions(result: ExtractionResult):
         r'((?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+[A-Za-z]?)[\s.:–—-]+[^\n]{5,})',
         re.IGNORECASE
     )
-    captions = caption_pattern.findall(text)
+    all_captions = caption_pattern.findall(text)  # [(full_caption, fig_num), ...]
 
     # 본문에서 figure 언급 문맥 추출
     context_pattern = re.compile(
         r'([^.]*(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*\d+[A-Za-z]?[^.]*\.)',
         re.IGNORECASE
     )
-    contexts = context_pattern.findall(text)
+    all_contexts = context_pattern.findall(text)
 
-    # 페이지 번호 기반으로 caption ↔ image 매칭
+    # 이미 사용된 캡션을 추적하여 중복 매칭 방지
+    used_captions = set()
+
     for img in result.images:
-        # 같은 페이지 또는 인접 페이지의 캡션 찾기
-        best_caption = ""
-        for full_cap, fig_num in captions:
-            # 페이지 텍스트에서 해당 캡션이 있는 위치 확인
-            page_marker = f"[Page {img.page_num}]"
-            prev_page_marker = f"[Page {img.page_num - 1}]"
-            next_page_marker = f"[Page {img.page_num + 1}]"
+        # 해당 페이지 ± 1 범위의 텍스트에서 캡션 탐색
+        nearby_text = ""
+        for p in [img.page_num, img.page_num - 1, img.page_num + 1]:
+            nearby_text += _get_page_text(text, p) + "\n"
 
-            for marker in [page_marker, prev_page_marker, next_page_marker]:
-                start = text.find(marker)
-                if start == -1:
-                    continue
-                end = text.find("[Page", start + 1)
-                page_text = text[start:end] if end != -1 else text[start:]
-                if full_cap in page_text:
-                    best_caption = full_cap.strip()
-                    break
-            if best_caption:
+        best_caption = ""
+        best_fig_num = ""
+        for full_cap, fig_num in all_captions:
+            if fig_num in used_captions:
+                continue
+            if full_cap in nearby_text:
+                best_caption = full_cap.strip()
+                best_fig_num = fig_num
+                used_captions.add(fig_num)
                 break
 
         img.caption = best_caption
+        img.figure_number = best_fig_num
 
-        # 관련 문맥 수집 (본문에서 해당 figure를 언급하는 문장들)
+        # 관련 문맥 수집 — figure_number 기반으로 정확한 매칭
+        search_num = best_fig_num if best_fig_num else str(img.index)
         related_contexts = []
-        for ctx in contexts:
-            # figure 번호가 이미지 인덱스와 매칭되는지 확인
-            nums = re.findall(r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+)', ctx, re.IGNORECASE)
-            if str(img.index) in nums:
+        for ctx in all_contexts:
+            nums = re.findall(
+                r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+)',
+                ctx, re.IGNORECASE
+            )
+            # figure_number의 숫자 부분으로 매칭 (예: "2A" → "2")
+            base_num = re.match(r'(\d+)', search_num)
+            if base_num and base_num.group(1) in nums:
                 related_contexts.append(ctx.strip())
-        img.context = " ".join(related_contexts[:5])  # 최대 5문장
+        img.context = " ".join(related_contexts[:5])
 
 
 # ─────────────────────────────────────────────
@@ -253,11 +276,14 @@ def _match_captions(result: ExtractionResult):
 class PaperAnalyzer:
     """Claude API를 사용한 다단계 논문 분석"""
 
-    def __init__(self, model: str = DEFAULT_MODEL, lang: str = "ko"):
-        self.client = anthropic.Anthropic()  # ANTHROPIC_API_KEY 환경변수 사용
+    def __init__(self, model: str = DEFAULT_MODEL, lang: str = "ko",
+                 cache_dir: Path | None = None):
+        self.client = anthropic.Anthropic()
         self.model = model
         self.lang = lang
-        self.result = AnalysisResult()
+        self.result = AnalysisResult(model=model)
+        self.cache_dir = cache_dir
+        self._token_lock = threading.Lock()
 
     def _lang_instruction(self) -> str:
         if self.lang == "ko":
@@ -282,10 +308,10 @@ class PaperAnalyzer:
                     system=system,
                     messages=messages,
                 )
-                # 토큰 사용량 누적
                 usage = response.usage
-                self.result.token_usage["input_tokens"] += usage.input_tokens
-                self.result.token_usage["output_tokens"] += usage.output_tokens
+                with self._token_lock:
+                    self.result.token_usage["input_tokens"] += usage.input_tokens
+                    self.result.token_usage["output_tokens"] += usage.output_tokens
 
                 return response.content[0].text
 
@@ -301,13 +327,37 @@ class PaperAnalyzer:
 
         return ""
 
+    def _save_cache(self, stage: str, data: str | list):
+        """중간 결과를 캐시 파일로 저장"""
+        if not self.cache_dir:
+            return
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = self.cache_dir / f"{stage}.json"
+        cache_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_cache(self, stage: str) -> str | list | None:
+        """캐시된 중간 결과 로드"""
+        if not self.cache_dir:
+            return None
+        cache_file = self.cache_dir / f"{stage}.json"
+        if cache_file.exists():
+            content = json.loads(cache_file.read_text(encoding="utf-8"))
+            print(f"  ♻️  캐시 로드: {stage}")
+            return content
+        return None
+
     # ── Stage 2: 텍스트 분석 ──
 
     def analyze_text(self, extraction: ExtractionResult) -> str:
         """전체 텍스트 기반 논문 구조 분석"""
         print("\n📄 [Stage 2/4] 텍스트 분석 중...")
 
-        system = f"""당신은 생명과학/구조생물학/제약 분야의 논문 분석 전문가입니다.
+        cached = self._load_cache("stage2_text")
+        if cached:
+            self.result.text_analysis = cached
+            return cached
+
+        system = f"""당신은 과학/공학 전 분야의 논문 분석 전문가입니다.
 첨부된 논문 텍스트를 정밀하게 분석하세요.
 
 {self._lang_instruction()}
@@ -335,18 +385,25 @@ class PaperAnalyzer:
         }]
 
         self.result.text_analysis = self._call_api(system, messages)
+        self._save_cache("stage2_text", self.result.text_analysis)
         print("  ✅ 텍스트 분석 완료")
         return self.result.text_analysis
 
-    # ── Stage 3: Figure/Table 개별 분석 ──
+    # ── Stage 3: Figure/Table 개별 분석 (병렬) ──
 
     def analyze_figures(self, extraction: ExtractionResult) -> list[dict]:
-        """각 Figure/Table 이미지를 개별 분석"""
+        """각 Figure/Table 이미지를 병렬로 분석"""
         if not extraction.images:
             print("\n🖼️  [Stage 3/4] 추출된 이미지 없음 — 건너뜀")
             return []
 
-        print(f"\n🖼️  [Stage 3/4] Figure/Table 분석 중... ({len(extraction.images)}개)")
+        cached = self._load_cache("stage3_figures")
+        if cached:
+            self.result.figure_analyses = cached
+            return cached
+
+        n = len(extraction.images)
+        print(f"\n🖼️  [Stage 3/4] Figure/Table 분석 중... ({n}개, 병렬 {FIGURE_CONCURRENCY})")
 
         system = f"""당신은 과학 논문의 Figure/Table 분석 전문가입니다.
 제공되는 이미지를 정밀하게 분석하세요.
@@ -368,11 +425,12 @@ class PaperAnalyzer:
 - 읽을 수 있는 텍스트/숫자는 정확히 옮기세요.
 - 불확실한 부분은 [불확실] 표시를 하세요."""
 
-        analyses = []
-        for img in extraction.images:
-            print(f"  🔍 이미지 {img.index}/{len(extraction.images)} (p.{img.page_num}) 분석 중...")
+        analyses = [None] * n  # 순서 보존용 슬롯
 
-            # 이미지 + 캡션 + 본문 문맥을 함께 전달
+        def _analyze_one(idx: int, img: ExtractedImage) -> dict:
+            label = f"Fig.{img.figure_number}" if img.figure_number else f"Image {img.index}"
+            print(f"  🔍 {label} (p.{img.page_num}) 분석 중...")
+
             content_blocks = [
                 {
                     "type": "image",
@@ -389,22 +447,47 @@ class PaperAnalyzer:
             ]
 
             messages = [{"role": "user", "content": content_blocks}]
-
             analysis_text = self._call_api(system, messages)
-            analyses.append({
+            result = {
                 "image_index": img.index,
+                "figure_number": img.figure_number,
                 "page": img.page_num,
                 "caption": img.caption,
                 "analysis": analysis_text,
-            })
-            print(f"  ✅ 이미지 {img.index} 완료")
+            }
+            print(f"  ✅ {label} 완료")
+            return result
 
-        self.result.figure_analyses = analyses
-        return analyses
+        with ThreadPoolExecutor(max_workers=FIGURE_CONCURRENCY) as executor:
+            futures = {
+                executor.submit(_analyze_one, i, img): i
+                for i, img in enumerate(extraction.images)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    analyses[idx] = future.result()
+                except Exception as e:
+                    img = extraction.images[idx]
+                    print(f"  ⚠️  Image {img.index} 분석 실패: {e}")
+                    analyses[idx] = {
+                        "image_index": img.index,
+                        "figure_number": img.figure_number,
+                        "page": img.page_num,
+                        "caption": img.caption,
+                        "analysis": f"[분석 실패: {e}]",
+                    }
+
+        self.result.figure_analyses = [a for a in analyses if a is not None]
+        self._save_cache("stage3_figures", self.result.figure_analyses)
+        return self.result.figure_analyses
 
     def _build_figure_prompt(self, img: ExtractedImage) -> str:
         """Figure 분석을 위한 프롬프트 구성"""
         parts = [f"이 이미지는 논문의 {img.page_num}페이지에 위치합니다."]
+
+        if img.figure_number:
+            parts.append(f"Figure/Table 번호: {img.figure_number}")
 
         if img.caption:
             parts.append(f"\n캡션(Caption): {img.caption}")
@@ -426,7 +509,8 @@ class PaperAnalyzer:
         if self.result.figure_analyses:
             parts = []
             for fa in self.result.figure_analyses:
-                header = f"### Image {fa['image_index']} (p.{fa['page']})"
+                fig_label = f"Figure {fa.get('figure_number', '')}" if fa.get('figure_number') else f"Image {fa['image_index']}"
+                header = f"### {fig_label} (p.{fa['page']})"
                 if fa["caption"]:
                     header += f"\nCaption: {fa['caption']}"
                 parts.append(f"{header}\n{fa['analysis']}")
@@ -499,6 +583,7 @@ class PaperAnalyzer:
         self.result.synthesis = self._call_api(
             system, messages, max_tokens=SYNTHESIS_MAX_TOKENS
         )
+        self._save_cache("stage4_synthesis", self.result.synthesis)
         print("  ✅ 종합 분석 완료")
         return self.result.synthesis
 
@@ -506,6 +591,16 @@ class PaperAnalyzer:
 # ─────────────────────────────────────────────
 # 메인 실행
 # ─────────────────────────────────────────────
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """모델명에서 가격 티어를 추출하여 비용 추정"""
+    for tier, (price_in, price_out) in MODEL_PRICING.items():
+        if tier in model:
+            return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
+    # 알 수 없는 모델은 sonnet 기준
+    price_in, price_out = MODEL_PRICING["sonnet"]
+    return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
+
 
 def print_summary(result: AnalysisResult, extraction: ExtractionResult):
     """실행 요약 출력"""
@@ -515,20 +610,15 @@ def print_summary(result: AnalysisResult, extraction: ExtractionResult):
     print("\n" + "=" * 60)
     print("📈 분석 완료 요약")
     print("=" * 60)
+    print(f"  모델: {result.model}")
     print(f"  논문 페이지 수: {extraction.metadata.get('pages', '?')}")
     print(f"  추출 텍스트 길이: {len(extraction.full_text):,} 문자")
     print(f"  추출 이미지 수: {len(extraction.images)}")
     print(f"  총 입력 토큰: {total_in:,}")
     print(f"  총 출력 토큰: {total_out:,}")
 
-    # 비용 추정 (Sonnet 4.6 기준: $3/$15 per MTok)
-    if "sonnet" in DEFAULT_MODEL or "sonnet" in str(result):
-        cost_in = total_in / 1_000_000 * 3
-        cost_out = total_out / 1_000_000 * 15
-    else:
-        cost_in = total_in / 1_000_000 * 5
-        cost_out = total_out / 1_000_000 * 25
-    print(f"  예상 비용: ~${cost_in + cost_out:.3f}")
+    cost = _estimate_cost(result.model, total_in, total_out)
+    print(f"  예상 비용: ~${cost:.3f}")
     print("=" * 60)
 
 
@@ -542,6 +632,7 @@ def main():
   python analyze_paper.py paper.pdf --model claude-opus-4-6
   python analyze_paper.py paper.pdf --output result.md --lang en
   python analyze_paper.py paper.pdf --text-only
+  python analyze_paper.py paper.pdf --resume        # 이전 중단 지점부터 재개
         """
     )
     parser.add_argument("pdf", help="분석할 PDF 파일 경로")
@@ -565,6 +656,14 @@ def main():
         "--max-images", type=int, default=IMAGE_MAX_COUNT,
         help=f"최대 분석 이미지 수 (기본: {IMAGE_MAX_COUNT})"
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="이전 중단 지점부터 재개 (캐시 활용)"
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="캐시를 사용하지 않고 처음부터 분석"
+    )
 
     args = parser.parse_args()
 
@@ -580,12 +679,12 @@ def main():
         sys.exit(1)
 
     # 출력 경로
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = pdf_path.with_suffix(".analysis.md")
+    output_path = Path(args.output) if args.output else pdf_path.with_suffix(".analysis.md")
 
-    max_images = args.max_images
+    # 캐시 디렉토리
+    cache_dir = None
+    if not args.no_cache:
+        cache_dir = pdf_path.parent / f".{pdf_path.stem}_cache"
 
     # ── 실행 ──
     print("=" * 60)
@@ -593,13 +692,15 @@ def main():
     print(f"   파일: {pdf_path.name}")
     print(f"   모델: {args.model}")
     print(f"   언어: {args.lang}")
+    if cache_dir:
+        print(f"   캐시: {cache_dir}")
     print("=" * 60)
 
     start_time = time.time()
 
     # Stage 1: PDF 전처리
     print("\n📦 [Stage 1/4] PDF 전처리 중...")
-    extraction = extract_from_pdf(str(pdf_path), max_images=max_images)
+    extraction = extract_from_pdf(str(pdf_path), max_images=args.max_images)
     print(f"  ✅ 텍스트: {len(extraction.full_text):,}자 / 이미지: {len(extraction.images)}개")
 
     if not extraction.full_text.strip():
@@ -607,7 +708,7 @@ def main():
         sys.exit(1)
 
     # Stage 2-4: 분석
-    analyzer = PaperAnalyzer(model=args.model, lang=args.lang)
+    analyzer = PaperAnalyzer(model=args.model, lang=args.lang, cache_dir=cache_dir)
 
     analyzer.analyze_text(extraction)
 
@@ -638,7 +739,6 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
     if result.synthesis:
         sections.append(result.synthesis)
     else:
-        # fallback: 텍스트 분석만
         sections.append("# 텍스트 분석 결과\n")
         sections.append(result.text_analysis)
 
@@ -647,7 +747,8 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
         sections.append("\n\n---\n")
         sections.append("# 부록: 개별 Figure/Table 분석 상세\n")
         for fa in result.figure_analyses:
-            sections.append(f"## Image {fa['image_index']} (p.{fa['page']})")
+            fig_label = f"Figure {fa.get('figure_number', '')}" if fa.get('figure_number') else f"Image {fa['image_index']}"
+            sections.append(f"## {fig_label} (p.{fa['page']})")
             if fa["caption"]:
                 sections.append(f"**Caption:** {fa['caption']}\n")
             sections.append(fa["analysis"])
@@ -655,8 +756,11 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
 
     # 토큰 사용량
     sections.append("\n---\n")
-    sections.append(f"*분석 토큰 사용량: 입력 {result.token_usage['input_tokens']:,} / "
-                     f"출력 {result.token_usage['output_tokens']:,}*")
+    total_in = result.token_usage['input_tokens']
+    total_out = result.token_usage['output_tokens']
+    cost = _estimate_cost(result.model, total_in, total_out)
+    sections.append(f"*분석 토큰 사용량: 입력 {total_in:,} / 출력 {total_out:,} | "
+                    f"예상 비용: ~${cost:.3f}*")
 
     return "\n".join(sections)
 

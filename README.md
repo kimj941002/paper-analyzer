@@ -11,12 +11,14 @@ PDF ──→ [Stage 1] 전처리 (텍스트 + 이미지 분리 추출)
            │
            ├─→ [Stage 2] 텍스트 전체 분석 (API 1회)
            │
-           ├─→ [Stage 3] Figure/Table 개별 분석 (API N회)
+           ├─→ [Stage 3] Figure/Table 개별 분석 (API N회, 병렬 4개)
            │      └─ 각 이미지 + caption + 본문 문맥을 함께 전달
            │
            └─→ [Stage 4] 종합 (API 1회)
                    └─ 텍스트 분석 + Figure 분석 교차 검증 → 최종 보고서
 ```
+
+각 Stage 완료 시 중간 결과가 캐시 파일로 저장되어, 중단 후 `--resume`으로 재개 가능합니다.
 
 ### 왜 이 방식이 더 정확한가?
 
@@ -62,6 +64,12 @@ python analyze_paper.py paper.pdf --text-only
 
 # 이미지 최대 분석 수 제한
 python analyze_paper.py paper.pdf --max-images 10
+
+# 중단된 분석 재개 (캐시 활용)
+python analyze_paper.py paper.pdf --resume
+
+# 캐시 무시하고 처음부터 분석
+python analyze_paper.py paper.pdf --no-cache
 ```
 
 ### 출력 예시
