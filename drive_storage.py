@@ -49,23 +49,40 @@ INDEX_HEADERS = [
 ]
 
 
+def _build_credentials(credentials_path: str = "", credentials_json: str = "") -> Credentials:
+    """파일 경로 또는 JSON 문자열로 인증 정보 생성"""
+    if credentials_json:
+        info = json.loads(credentials_json)
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+    elif credentials_path:
+        return Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
+    else:
+        raise ValueError("credentials_path 또는 credentials_json 중 하나는 필수")
+
+
 class DriveStorage:
     """Google Drive + Sheets 기반 논문 저장소"""
 
-    def __init__(self, credentials_path: str, root_folder_id: str, sheet_id: str):
+    def __init__(
+        self,
+        root_folder_id: str,
+        sheet_id: str,
+        credentials_path: str = "",
+        credentials_json: str = "",
+    ):
         """
         Parameters
         ----------
-        credentials_path : str
-            Service Account JSON 키 파일 경로
         root_folder_id : str
             Drive "Paper-Analysis-DB" 루트 폴더 ID
         sheet_id : str
             Google Sheets 인덱스 문서 ID
+        credentials_path : str
+            Service Account JSON 키 파일 경로 (credentials_json과 택 1)
+        credentials_json : str
+            Service Account JSON 키 내용 문자열 (credentials_path와 택 1)
         """
-        creds = Credentials.from_service_account_file(
-            credentials_path, scopes=SCOPES
-        )
+        creds = _build_credentials(credentials_path, credentials_json)
         self.drive = build("drive", "v3", credentials=creds)
         self.gc = gspread.authorize(creds)
         self.sheet = self.gc.open_by_key(sheet_id).sheet1
