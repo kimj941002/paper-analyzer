@@ -9,6 +9,7 @@
 """
 
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -65,13 +66,113 @@ st.title("🔬 논문 분석 파이프라인")
 drive_creds_json = _load_secret("GDRIVE_CREDENTIALS_JSON") if DRIVE_AVAILABLE else ""
 drive_folder_id = _load_secret("GDRIVE_FOLDER_ID") if DRIVE_AVAILABLE else ""
 drive_sheet_id = _load_secret("GDRIVE_SHEET_ID") if DRIVE_AVAILABLE else ""
-_drive_ready = DRIVE_AVAILABLE and drive_creds_json and drive_folder_id and drive_sheet_id
+_drive_ready = DRIVE_AVAILABLE and bool(drive_creds_json) and bool(drive_folder_id) and bool(drive_sheet_id)
+
+# ─────────────────────────────────────────────
+# session_state 초기화
+# ─────────────────────────────────────────────
+
+if "analysis_done" not in st.session_state:
+    st.session_state.analysis_done = False
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+if "extraction" not in st.session_state:
+    st.session_state.extraction = None
+if "output_md" not in st.session_state:
+    st.session_state.output_md = ""
+if "output_filename" not in st.session_state:
+    st.session_state.output_filename = ""
+if "analysis_model" not in st.session_state:
+    st.session_state.analysis_model = ""
+if "analysis_cost" not in st.session_state:
+    st.session_state.analysis_cost = 0.0
+if "analysis_lang" not in st.session_state:
+    st.session_state.analysis_lang = "ko"
+if "analysis_elapsed" not in st.session_state:
+    st.session_state.analysis_elapsed = 0.0
+if "drive_saved" not in st.session_state:
+    st.session_state.drive_saved = False
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = None
+if "pdf_filename" not in st.session_state:
+    st.session_state.pdf_filename = ""
 
 # ─────────────────────────────────────────────
 # 메인 탭: 분석 / 데이터베이스
 # ─────────────────────────────────────────────
 
 tab_analyze, tab_db = st.tabs(["📄 논문 분석", "📚 데이터베이스"])
+
+# ═════════════════════════════════════════════
+# 사이드바: 설정 (탭 밖에서 렌더링)
+# ═════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("⚙️ 설정")
+
+    # API 키: Secrets에서 자동 로딩, 없으면 입력란 표시
+    api_key = _load_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        api_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-api03-...",
+            help="https://console.anthropic.com/settings/keys 에서 발급",
+        )
+        st.divider()
+
+    # 모델 선택
+    model = st.selectbox(
+        "모델 선택",
+        options=[
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+        ],
+        index=0,
+        help="Sonnet: 균형 / Opus: 최고 정밀도 / Haiku: 빠르고 저렴",
+    )
+
+    # 언어 선택
+    lang = st.selectbox(
+        "분석 언어",
+        options=["ko", "en"],
+        format_func=lambda x: "🇰🇷 한국어" if x == "ko" else "🇺🇸 English",
+    )
+
+    # 옵션
+    text_only = st.checkbox(
+        "텍스트만 분석 (Figure 건너뜀)",
+        help="빠르고 저렴하지만 Figure 분석 없음",
+    )
+
+    max_images = st.slider(
+        "최대 이미지 분석 수",
+        min_value=1,
+        max_value=30,
+        value=IMAGE_MAX_COUNT,
+        disabled=text_only,
+    )
+
+    st.divider()
+
+    # ── Google Drive 상태 ──
+    st.subheader("☁️ Google Drive")
+
+    if _drive_ready:
+        st.success("Drive 연결됨", icon="✅")
+    elif DRIVE_AVAILABLE:
+        st.warning("⚠️ Secrets에 `GDRIVE_CREDENTIALS_JSON`, `GDRIVE_FOLDER_ID`, `GDRIVE_SHEET_ID`를 설정하세요.")
+    else:
+        st.caption("_비활성: `pip install gspread google-api-python-client google-auth` 필요_")
+
+    st.divider()
+
+    # 비용 안내
+    st.caption("💰 **예상 비용 참고**")
+    st.caption("Sonnet: ~$0.05–0.20/논문")
+    st.caption("Opus: ~$0.15–0.60/논문")
+    st.caption("Haiku: ~$0.01–0.03/논문")
 
 # ═════════════════════════════════════════════
 # 탭 1: 논문 분석
@@ -81,87 +182,7 @@ with tab_analyze:
     st.caption("PDF 업로드 → Claude API로 4단계 자동 분석 → 결과 다운로드")
 
     # ─────────────────────────────────────────
-    # 사이드바: 설정
-    # ─────────────────────────────────────────
-
-    with st.sidebar:
-        st.header("⚙️ 설정")
-
-        # API 키: Secrets에서 자동 로딩, 없으면 입력란 표시
-        api_key = _load_secret("ANTHROPIC_API_KEY")
-        if not api_key:
-            api_key = st.text_input(
-                "Anthropic API Key",
-                type="password",
-                placeholder="sk-ant-api03-...",
-                help="https://console.anthropic.com/settings/keys 에서 발급",
-            )
-            st.divider()
-
-        # 모델 선택
-        model = st.selectbox(
-            "모델 선택",
-            options=[
-                "claude-sonnet-4-6",
-                "claude-opus-4-6",
-                "claude-haiku-4-5-20251001",
-            ],
-            index=0,
-            help="Sonnet: 균형 / Opus: 최고 정밀도 / Haiku: 빠르고 저렴",
-        )
-
-        # 언어 선택
-        lang = st.selectbox(
-            "분석 언어",
-            options=["ko", "en"],
-            format_func=lambda x: "🇰🇷 한국어" if x == "ko" else "🇺🇸 English",
-        )
-
-        # 옵션
-        text_only = st.checkbox(
-            "텍스트만 분석 (Figure 건너뜀)",
-            help="빠르고 저렴하지만 Figure 분석 없음",
-        )
-
-        max_images = st.slider(
-            "최대 이미지 분석 수",
-            min_value=1,
-            max_value=30,
-            value=IMAGE_MAX_COUNT,
-            disabled=text_only,
-        )
-
-        st.divider()
-
-        # ── Google Drive 저장 설정 ──
-        st.subheader("☁️ Google Drive 저장")
-
-        if DRIVE_AVAILABLE:
-            enable_drive = st.checkbox("분석 완료 후 Drive에 자동 저장")
-            if enable_drive:
-                drive_tags = st.text_input(
-                    "태그 (쉼표 구분)",
-                    placeholder="ML, NLP, Transformer",
-                )
-                if not _drive_ready:
-                    st.warning("⚠️ Streamlit Secrets에 `GDRIVE_CREDENTIALS_JSON`, `GDRIVE_FOLDER_ID`, `GDRIVE_SHEET_ID`를 설정하세요.")
-            else:
-                drive_tags = ""
-        else:
-            enable_drive = False
-            drive_tags = ""
-            st.caption("_비활성: `pip install gspread google-api-python-client google-auth` 필요_")
-
-        st.divider()
-
-        # 비용 안내
-        st.caption("💰 **예상 비용 참고**")
-        st.caption("Sonnet: ~$0.05–0.20/논문")
-        st.caption("Opus: ~$0.15–0.60/논문")
-        st.caption("Haiku: ~$0.01–0.03/논문")
-
-    # ─────────────────────────────────────────
-    # 메인: PDF 업로드
+    # PDF 업로드
     # ─────────────────────────────────────────
 
     uploaded_file = st.file_uploader(
@@ -187,9 +208,18 @@ with tab_analyze:
         # API 키 설정
         os.environ["ANTHROPIC_API_KEY"] = api_key
 
+        # PDF 바이트 저장 (Drive 저장용)
+        pdf_bytes = uploaded_file.read()
+        st.session_state.pdf_bytes = pdf_bytes
+        st.session_state.pdf_filename = uploaded_file.name
+
+        # 이전 결과 초기화
+        st.session_state.analysis_done = False
+        st.session_state.drive_saved = False
+
         # 임시 파일로 PDF 저장
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(uploaded_file.read())
+            tmp.write(pdf_bytes)
             tmp_path = tmp.name
 
         try:
@@ -241,99 +271,143 @@ with tab_analyze:
 
             elapsed = time.time() - start_time
 
-            # ── 결과 표시 ──
-            st.divider()
-
-            # 요약 메트릭
-            total_in = analyzer.result.token_usage["input_tokens"]
-            total_out = analyzer.result.token_usage["output_tokens"]
-            cost = _estimate_cost(model, total_in, total_out)
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("⏱️ 소요 시간", f"{elapsed:.0f}초")
-            col2.metric("📊 입력 토큰", f"{total_in:,}")
-            col3.metric("📝 출력 토큰", f"{total_out:,}")
-            col4.metric("💰 예상 비용", f"${cost:.3f}")
-
-            st.divider()
-
-            # 분석 결과 (탭)
-            result_tab_main, result_tab_text, result_tab_figures = st.tabs([
-                "📋 종합 보고서", "📄 텍스트 분석 원문", "🖼️ Figure 개별 분석"
-            ])
-
-            with result_tab_main:
-                st.markdown(analyzer.result.synthesis or "_(종합 분석 결과 없음)_")
-
-            with result_tab_text:
-                st.markdown(analyzer.result.text_analysis or "_(텍스트 분석 결과 없음)_")
-
-            with result_tab_figures:
-                if analyzer.result.figure_analyses:
-                    for fa in analyzer.result.figure_analyses:
-                        fig_label = (
-                            f"Figure {fa.get('figure_number', '')}"
-                            if fa.get("figure_number")
-                            else f"Image {fa['image_index']}"
-                        )
-                        with st.expander(f"{fig_label} (p.{fa['page']})"):
-                            if fa["caption"]:
-                                st.caption(f"**Caption:** {fa['caption']}")
-                            st.markdown(fa["analysis"])
-                else:
-                    st.info("Figure 분석 결과가 없습니다.")
-
-            # 다운로드 버튼
-            st.divider()
-
-            # argparse Namespace 흉내
+            # ── session_state에 결과 저장 ──
             class _Args:
                 pass
             args = _Args()
             args.model = model
 
             output_md = _build_output(analyzer.result, extraction, args)
-            output_filename = Path(uploaded_file.name).stem + ".analysis.md"
 
+            st.session_state.analysis_done = True
+            st.session_state.analysis_result = analyzer.result
+            st.session_state.extraction = extraction
+            st.session_state.output_md = output_md
+            st.session_state.output_filename = Path(uploaded_file.name).stem + ".analysis.md"
+            st.session_state.analysis_model = model
+            st.session_state.analysis_lang = lang
+            st.session_state.analysis_elapsed = elapsed
+            total_in = analyzer.result.token_usage["input_tokens"]
+            total_out = analyzer.result.token_usage["output_tokens"]
+            st.session_state.analysis_cost = _estimate_cost(model, total_in, total_out)
+
+        finally:
+            os.unlink(tmp_path)
+
+    # ─────────────────────────────────────────
+    # 결과 표시 (session_state에서 — 리렌더 후에도 유지)
+    # ─────────────────────────────────────────
+
+    if st.session_state.analysis_done and st.session_state.analysis_result:
+        result = st.session_state.analysis_result
+        extraction = st.session_state.extraction
+
+        st.divider()
+
+        # 요약 메트릭
+        total_in = result.token_usage["input_tokens"]
+        total_out = result.token_usage["output_tokens"]
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("⏱️ 소요 시간", f"{st.session_state.analysis_elapsed:.0f}초")
+        col2.metric("📊 입력 토큰", f"{total_in:,}")
+        col3.metric("📝 출력 토큰", f"{total_out:,}")
+        col4.metric("💰 예상 비용", f"${st.session_state.analysis_cost:.3f}")
+
+        st.divider()
+
+        # 분석 결과 (탭)
+        result_tab_main, result_tab_text, result_tab_figures = st.tabs([
+            "📋 종합 보고서", "📄 텍스트 분석 원문", "🖼️ Figure 개별 분석"
+        ])
+
+        with result_tab_main:
+            st.markdown(result.synthesis or "_(종합 분석 결과 없음)_")
+
+        with result_tab_text:
+            st.markdown(result.text_analysis or "_(텍스트 분석 결과 없음)_")
+
+        with result_tab_figures:
+            if result.figure_analyses:
+                for fa in result.figure_analyses:
+                    fig_label = (
+                        f"Figure {fa.get('figure_number', '')}"
+                        if fa.get("figure_number")
+                        else f"Image {fa['image_index']}"
+                    )
+                    with st.expander(f"{fig_label} (p.{fa['page']})"):
+                        if fa["caption"]:
+                            st.caption(f"**Caption:** {fa['caption']}")
+                        st.markdown(fa["analysis"])
+            else:
+                st.info("Figure 분석 결과가 없습니다.")
+
+        # ── 다운로드 + Drive 저장 버튼 ──
+        st.divider()
+
+        dl_col, drive_col = st.columns(2)
+
+        with dl_col:
             st.download_button(
                 label="📥 분석 결과 다운로드 (.md)",
-                data=output_md,
-                file_name=output_filename,
+                data=st.session_state.output_md,
+                file_name=st.session_state.output_filename,
                 mime="text/markdown",
                 use_container_width=True,
             )
 
-            # ── Google Drive 저장 ──
-            if enable_drive and _drive_ready:
-                st.divider()
-                with st.status("☁️ Google Drive에 저장 중...", expanded=True) as drive_status:
-                    try:
-                        storage = DriveStorage(
-                            root_folder_id=drive_folder_id,
-                            sheet_id=drive_sheet_id,
-                            credentials_json=drive_creds_json,
-                        )
-                        save_result = storage.save(
-                            pdf_path=tmp_path,
-                            analysis_md=output_md,
-                            result=analyzer.result,
-                            model=model,
-                            lang=lang,
-                            cost=cost,
-                            tags=drive_tags,
-                        )
-                        st.write(f"✅ 저장 완료 — [Drive 폴더 열기]({save_result['folder_link']})")
-                        drive_status.update(label="☁️ Google Drive 저장 완료 ✅", state="complete")
-                    except FileNotFoundError:
-                        st.error("❌ Service Account JSON 파일을 찾을 수 없습니다. 경로를 확인하세요.")
-                        drive_status.update(label="☁️ Drive 저장 실패", state="error")
-                    except Exception as e:
-                        st.error(f"❌ Drive 저장 중 오류: {e}")
-                        drive_status.update(label="☁️ Drive 저장 실패", state="error")
+        with drive_col:
+            if _drive_ready:
+                if st.session_state.drive_saved:
+                    st.success("✅ Google Drive에 저장 완료!")
+                else:
+                    drive_tags = st.text_input(
+                        "태그 (쉼표 구분, 선택사항)",
+                        placeholder="ML, NLP, Transformer",
+                        key="drive_tags_input",
+                    )
+                    if st.button("☁️ Google Drive에 저장", type="primary", use_container_width=True, key="save_to_drive"):
+                        # 임시 파일로 PDF 재생성 (Drive 업로드용)
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                            tmp.write(st.session_state.pdf_bytes)
+                            tmp_path = tmp.name
 
-        finally:
-            # 임시 파일 정리
-            os.unlink(tmp_path)
+                        try:
+                            with st.spinner("☁️ Google Drive에 저장 중..."):
+                                storage = DriveStorage(
+                                    root_folder_id=drive_folder_id,
+                                    sheet_id=drive_sheet_id,
+                                    credentials_json=drive_creds_json,
+                                )
+                                save_result = storage.save(
+                                    pdf_path=tmp_path,
+                                    analysis_md=st.session_state.output_md,
+                                    result=result,
+                                    model=st.session_state.analysis_model,
+                                    lang=st.session_state.analysis_lang,
+                                    cost=st.session_state.analysis_cost,
+                                    tags=drive_tags,
+                                )
+                            st.session_state.drive_saved = True
+                            st.success(f"✅ 저장 완료! — [Drive 폴더 열기]({save_result['folder_link']})")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Drive 저장 실패: {e}")
+                        finally:
+                            os.unlink(tmp_path)
+            else:
+                st.info("☁️ Drive 연결 미설정 — Secrets 확인 필요")
+
+        # 새 분석 시작 버튼
+        st.divider()
+        if st.button("🔄 새로운 논문 분석", use_container_width=True):
+            st.session_state.analysis_done = False
+            st.session_state.analysis_result = None
+            st.session_state.extraction = None
+            st.session_state.output_md = ""
+            st.session_state.drive_saved = False
+            st.session_state.pdf_bytes = None
+            st.rerun()
 
 # ═════════════════════════════════════════════
 # 탭 2: 데이터베이스
@@ -424,12 +498,10 @@ with tab_db:
 
                     # 분석 내용 인라인 보기
                     if analysis_link:
-                        # analysis_link에서 file ID 추출
-                        import re as _re
-                        _fid_match = _re.search(r"/d/([a-zA-Z0-9_-]+)", analysis_link)
+                        _fid_match = re.search(r"/d/([a-zA-Z0-9_-]+)", analysis_link)
                         if _fid_match:
                             _file_id = _fid_match.group(1)
-                            if st.button(f"📖 분석 내용 펼치기", key=f"view_{paper.get('paper_id', title)}"):
+                            if st.button("📖 분석 내용 펼치기", key=f"view_{paper.get('paper_id', title)}"):
                                 try:
                                     storage = DriveStorage(
                                         root_folder_id=drive_folder_id,
