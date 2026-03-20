@@ -115,12 +115,27 @@ def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> Extrac
             page_texts.append(f"[Page {page_num + 1}]\n{text}")
     result.full_text = "\n\n".join(page_texts)
 
-    # ── 이미지 추출 ──
-    images = _extract_embedded_images(doc)
+    # ── 이미지 추출 (하이브리드: 내장 + 페이지 렌더링) ──
+    embedded = _extract_embedded_images(doc)
 
-    # 내장 이미지가 적으면 페이지 렌더링 방식도 시도
-    if len(images) < 2:
-        images = _extract_page_renders(doc)
+    # 본문에서 Figure/Table 번호 목록 추출
+    fig_numbers_in_text = set(re.findall(
+        r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+)',
+        result.full_text, re.IGNORECASE
+    ))
+
+    # 내장 이미지가 있는 페이지 기록
+    embedded_pages = {img.page_num for img in embedded}
+
+    # Figure/Table 캡션이 있지만 내장 이미지가 없는 페이지를 렌더링
+    rendered = _extract_page_renders(doc, skip_pages=embedded_pages)
+
+    # 합산: 내장 이미지 + 누락 페이지 렌더링
+    images = embedded + rendered
+    # index 재정렬 (페이지 순)
+    images.sort(key=lambda img: (img.page_num, img.index))
+    for i, img in enumerate(images):
+        img.index = i + 1
 
     result.images = images[:max_images]
 
@@ -175,14 +190,37 @@ def _extract_embedded_images(doc: fitz.Document) -> list[ExtractedImage]:
     return images
 
 
-def _extract_page_renders(doc: fitz.Document) -> list[ExtractedImage]:
-    """각 페이지를 이미지로 렌더링 (내장 이미지 추출이 실패한 경우 fallback)"""
+def _extract_page_renders(
+    doc: fitz.Document,
+    skip_pages: set[int] | None = None,
+) -> list[ExtractedImage]:
+    """Figure/Table 캡션이 있는 페이지를 이미지로 렌더링.
+
+    skip_pages: 이미 내장 이미지가 추출된 페이지 번호(1-based) — 중복 방지
+    """
+    if skip_pages is None:
+        skip_pages = set()
+
+    # Figure/Table 캡션 패턴
+    caption_pattern = re.compile(
+        r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*\d+',
+        re.IGNORECASE,
+    )
+
     images = []
     for page_num, page in enumerate(doc):
-        blocks = page.get_text("dict")["blocks"]
-        image_blocks = [b for b in blocks if b.get("type") == 1]
+        pnum = page_num + 1
+        if pnum in skip_pages:
+            continue
 
-        if not image_blocks:
+        page_text = page.get_text("text")
+
+        # 이 페이지에 Figure/Table 캡션이 있거나, 이미지 블록이 있으면 렌더링
+        has_caption = bool(caption_pattern.search(page_text))
+        blocks = page.get_text("dict")["blocks"]
+        has_image_block = any(b.get("type") == 1 for b in blocks)
+
+        if not has_caption and not has_image_block:
             continue
 
         mat = fitz.Matrix(IMAGE_DPI / 72, IMAGE_DPI / 72)
@@ -192,7 +230,7 @@ def _extract_page_renders(doc: fitz.Document) -> list[ExtractedImage]:
 
         images.append(ExtractedImage(
             index=len(images) + 1,
-            page_num=page_num + 1,
+            page_num=pnum,
             base64_data=b64,
             media_type="image/png",
             width=pix.width,
@@ -529,10 +567,19 @@ class PaperAnalyzer:
                 parts.append(f"{header}\n{fa['analysis']}")
             figure_summary = "\n\n".join(parts)
 
-        system = f"""당신은 과학 논문 분석의 최종 종합 전문가입니다.
-아래에 제공되는 두 가지 분석 결과를 종합하여 하나의 완성된 논문 분석 보고서를 작성하세요.
+        system = f"""당신은 과학 논문의 내용을 정확하게 정리하는 전문가입니다.
+아래에 제공되는 텍스트 분석과 Figure/Table 분석 결과를 하나로 통합하여,
+논문의 내용을 충실히 전달하는 완성된 보고서를 작성하세요.
 
 {self._lang_instruction()}
+
+■ 핵심 원칙:
+- 텍스트와 Figure/Table 분석은 같은 논문의 서로 다른 측면을 다룬 것입니다.
+  이를 하나의 매끄러운 보고서로 통합하세요.
+- 두 분석 간의 차이점을 지적하거나 비교하지 마세요.
+  논문 원문의 내용을 정확히 전달하는 데만 집중하세요.
+- Figure/Table의 데이터와 텍스트의 설명을 자연스럽게 결합하여
+  각 결과 섹션에서 함께 기술하세요.
 
 ■ 출력 양식 (반드시 준수):
 
@@ -553,7 +600,7 @@ class PaperAnalyzer:
 
 ## 3. 주요 결과
 ### 3.1 [결과 주제 1]
-  - Figure/Table 연계: 해당 Figure의 분석 결과를 통합하여 기술
+  - 텍스트 설명과 해당 Figure/Table 데이터를 통합하여 기술
   - 핵심 수치 데이터
 ### 3.2 [결과 주제 2]
   ...
@@ -570,17 +617,14 @@ class PaperAnalyzer:
 
 ## 6. 핵심 요약 (3-5문장)
 
-## 7. 비판적 검토
-(방법론의 적절성, 결론의 논리적 타당성, 잠재적 한계에 대한 분석자의 의견)
-
 ---
 
-■ 종합 시 핵심 지침:
-- 텍스트 분석과 Figure 분석의 내용을 교차 검증하세요.
-- 텍스트에서 언급된 수치와 Figure에서 관찰된 수치가 일치하는지 확인하세요.
-- 불일치가 있으면 [⚠️ 불일치] 표시와 함께 양쪽 내용을 모두 기록하세요.
-- 텍스트에만 있는 정보, Figure에만 있는 정보를 각각 놓치지 마세요.
-- 확인할 수 없는 내용은 [미확인]으로 표시하세요."""
+■ 작성 지침:
+- "텍스트 분석에서는~", "Figure 분석에서는~" 같은 메타 표현을 사용하지 마세요.
+  마치 논문을 직접 읽고 정리한 것처럼 작성하세요.
+- 수치 데이터(IC50, Kd, 해상도, p-value 등)는 정확히 기록하세요.
+- 모든 Figure와 Table의 핵심 데이터를 해당 결과 섹션에 자연스럽게 포함하세요.
+- 논문에 명시적으로 기술된 내용만 작성하고, 추측은 피하세요."""
 
         user_content = f"""## A. 텍스트 분석 결과
 
@@ -590,7 +634,8 @@ class PaperAnalyzer:
 
 {figure_summary if figure_summary else "(추출된 Figure/Table 없음)"}
 
-위 두 분석을 종합하여 최종 논문 분석 보고서를 작성하세요."""
+위 내용을 통합하여 논문의 내용을 정확히 전달하는 최종 보고서를 작성하세요.
+두 분석 소스 간의 비교나 차이점 언급 없이, 하나의 완성된 논문 분석으로 작성하세요."""
 
         messages = [{"role": "user", "content": user_content}]
         self.result.synthesis = self._call_api(
