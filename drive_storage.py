@@ -262,3 +262,17 @@ class DriveStorage:
             "pdf_link": pdf_result.get("webViewLink", ""),
             "analysis_link": md_result.get("webViewLink", ""),
         }
+
+    # ── 조회 ──
+
+    def list_papers(self) -> list[dict]:
+        """Sheets 인덱스에서 모든 논문 목록을 반환"""
+        rows = self.sheet.get_all_records()
+        return rows
+
+    def get_file_content(self, file_id: str) -> str:
+        """Drive 파일 ID로 텍스트 내용을 다운로드하여 반환"""
+        content = self.drive.files().get_media(fileId=file_id).execute()
+        if isinstance(content, bytes):
+            return content.decode("utf-8")
+        return str(content)
