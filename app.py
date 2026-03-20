@@ -13,10 +13,21 @@ import tempfile
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import streamlit as st
+
+# .env 또는 Streamlit Secrets에서 환경변수 로딩
+def _load_secret(key: str, default: str = "") -> str:
+    """st.secrets → 환경변수 순으로 값을 찾는다."""
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError):
+        return os.environ.get(key, default)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except ImportError:
+    pass
 
 from analyze_paper import (
     ExtractionResult,
@@ -55,15 +66,16 @@ st.caption("PDF 업로드 → Claude API로 4단계 자동 분석 → 결과 다
 with st.sidebar:
     st.header("⚙️ 설정")
 
-    # API 키 입력
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-api03-...",
-        help="https://console.anthropic.com/settings/keys 에서 발급",
-    )
-
-    st.divider()
+    # API 키: Secrets에서 자동 로딩, 없으면 입력란 표시
+    api_key = _load_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        api_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-api03-...",
+            help="https://console.anthropic.com/settings/keys 에서 발급",
+        )
+        st.divider()
 
     # 모델 선택
     model = st.selectbox(
@@ -106,24 +118,16 @@ with st.sidebar:
     if DRIVE_AVAILABLE:
         enable_drive = st.checkbox("분석 완료 후 Drive에 자동 저장")
         if enable_drive:
-            drive_folder_id = st.text_input(
-                "루트 폴더 ID",
-                value=os.environ.get("GDRIVE_FOLDER_ID", ""),
-                help="Paper-Analysis-DB 폴더의 Google Drive ID",
-            )
-            drive_sheet_id = st.text_input(
-                "인덱스 Sheets ID",
-                value=os.environ.get("GDRIVE_SHEET_ID", ""),
-                help="인덱스용 Google Sheets 문서 ID",
-            )
+            drive_folder_id = _load_secret("GDRIVE_FOLDER_ID")
+            drive_sheet_id = _load_secret("GDRIVE_SHEET_ID")
+            drive_creds_json = _load_secret("GDRIVE_CREDENTIALS_JSON")
             drive_tags = st.text_input(
                 "태그 (쉼표 구분)",
                 placeholder="ML, NLP, Transformer",
             )
-            # 인증 정보: .env의 GDRIVE_CREDENTIALS_JSON 자동 사용
-            drive_creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
-            if not drive_creds_json:
-                st.warning("⚠️ `.env`에 `GDRIVE_CREDENTIALS_JSON`이 설정되지 않았습니다.")
+            # 설정 누락 경고
+            if not drive_creds_json or not drive_folder_id or not drive_sheet_id:
+                st.warning("⚠️ Streamlit Secrets에 `GDRIVE_CREDENTIALS_JSON`, `GDRIVE_FOLDER_ID`, `GDRIVE_SHEET_ID`를 설정하세요.")
         else:
             drive_folder_id = drive_sheet_id = drive_tags = ""
             drive_creds_json = ""
@@ -162,11 +166,8 @@ if uploaded_file and st.button("🚀 분석 시작", type="primary", use_contain
 
     # 입력 검증
     if not api_key:
-        st.error("❌ 사이드바에서 API Key를 입력하세요.")
+        st.error("❌ API Key가 없습니다. Streamlit Secrets에 `ANTHROPIC_API_KEY`를 설정하세요.")
         st.stop()
-
-    if not api_key.startswith("sk-ant-"):
-        st.warning("⚠️ API Key 형식이 올바르지 않을 수 있습니다. 확인해주세요.")
 
     # API 키 설정
     os.environ["ANTHROPIC_API_KEY"] = api_key
