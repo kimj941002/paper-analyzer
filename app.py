@@ -13,10 +13,21 @@ import tempfile
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv(override=True)
-
 import streamlit as st
+
+# .env 또는 Streamlit Secrets에서 환경변수 로딩
+def _load_secret(key: str, default: str = "") -> str:
+    """st.secrets → 환경변수 순으로 값을 찾는다."""
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError):
+        return os.environ.get(key, default)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except ImportError:
+    pass
 
 from analyze_paper import (
     ExtractionResult,
@@ -108,22 +119,22 @@ with st.sidebar:
         if enable_drive:
             drive_folder_id = st.text_input(
                 "루트 폴더 ID",
-                value=os.environ.get("GDRIVE_FOLDER_ID", ""),
+                value=_load_secret("GDRIVE_FOLDER_ID"),
                 help="Paper-Analysis-DB 폴더의 Google Drive ID",
             )
             drive_sheet_id = st.text_input(
                 "인덱스 Sheets ID",
-                value=os.environ.get("GDRIVE_SHEET_ID", ""),
+                value=_load_secret("GDRIVE_SHEET_ID"),
                 help="인덱스용 Google Sheets 문서 ID",
             )
             drive_tags = st.text_input(
                 "태그 (쉼표 구분)",
                 placeholder="ML, NLP, Transformer",
             )
-            # 인증 정보: .env의 GDRIVE_CREDENTIALS_JSON 자동 사용
-            drive_creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
+            # 인증 정보: Streamlit Secrets 또는 .env에서 자동 사용
+            drive_creds_json = _load_secret("GDRIVE_CREDENTIALS_JSON")
             if not drive_creds_json:
-                st.warning("⚠️ `.env`에 `GDRIVE_CREDENTIALS_JSON`이 설정되지 않았습니다.")
+                st.warning("⚠️ Streamlit Secrets 또는 `.env`에 `GDRIVE_CREDENTIALS_JSON`이 설정되지 않았습니다.")
         else:
             drive_folder_id = drive_sheet_id = drive_tags = ""
             drive_creds_json = ""
