@@ -103,11 +103,6 @@ with st.sidebar:
     if DRIVE_AVAILABLE:
         enable_drive = st.checkbox("분석 완료 후 Drive에 자동 저장")
         if enable_drive:
-            drive_creds_path = st.text_input(
-                "Service Account JSON 경로",
-                value=os.environ.get("GDRIVE_CREDENTIALS", ""),
-                help="Google Cloud 서비스 계정 키 파일 경로 (.json)",
-            )
             drive_folder_id = st.text_input(
                 "루트 폴더 ID",
                 value=os.environ.get("GDRIVE_FOLDER_ID", ""),
@@ -122,11 +117,17 @@ with st.sidebar:
                 "태그 (쉼표 구분)",
                 placeholder="ML, NLP, Transformer",
             )
+            # 인증 정보: .env의 GDRIVE_CREDENTIALS_JSON 자동 사용
+            drive_creds_json = os.environ.get("GDRIVE_CREDENTIALS_JSON", "")
+            if not drive_creds_json:
+                st.warning("⚠️ `.env`에 `GDRIVE_CREDENTIALS_JSON`이 설정되지 않았습니다.")
         else:
-            drive_creds_path = drive_folder_id = drive_sheet_id = drive_tags = ""
+            drive_folder_id = drive_sheet_id = drive_tags = ""
+            drive_creds_json = ""
     else:
         enable_drive = False
-        drive_creds_path = drive_folder_id = drive_sheet_id = drive_tags = ""
+        drive_folder_id = drive_sheet_id = drive_tags = ""
+        drive_creds_json = ""
         st.caption("_비활성: `pip install gspread google-api-python-client google-auth` 필요_")
 
     st.divider()
@@ -284,14 +285,14 @@ if uploaded_file and st.button("🚀 분석 시작", type="primary", use_contain
         )
 
         # ── Google Drive 저장 ──
-        if enable_drive and drive_creds_path and drive_folder_id and drive_sheet_id:
+        if enable_drive and drive_creds_json and drive_folder_id and drive_sheet_id:
             st.divider()
             with st.status("☁️ Google Drive에 저장 중...", expanded=True) as drive_status:
                 try:
                     storage = DriveStorage(
-                        credentials_path=drive_creds_path,
                         root_folder_id=drive_folder_id,
                         sheet_id=drive_sheet_id,
+                        credentials_json=drive_creds_json,
                     )
                     save_result = storage.save(
                         pdf_path=tmp_path,
