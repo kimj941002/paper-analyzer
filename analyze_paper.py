@@ -263,6 +263,7 @@ def _render_manifest_pages(
     max_images: int,
 ) -> list[ExtractedImage]:
     """매니페스트에 등재된 Figure/Table이 있는 페이지를 렌더링"""
+    import fitz  # noqa: F811
     images = []
 
     # 동일 페이지에 여러 Figure가 있을 수 있으므로 페이지별로 그룹핑
@@ -321,6 +322,7 @@ def _render_visual_pages(
 ) -> list[ExtractedImage]:
     """매니페스트에 없지만 시각 요소가 있는 페이지를 추가 렌더링
     (Supplementary figure, 캡션 없는 도식 등 보완)"""
+    import fitz  # noqa: F811
     if remaining_slots <= 0:
         return []
 
