@@ -13,6 +13,7 @@ Claude API를 통해 단계적으로 분석하는 스크립트.
     python analyze_paper.py paper.pdf --model claude-opus-4-6 --lang ko
     python analyze_paper.py paper.pdf --output result.md --lang en
 """
+from __future__ import annotations
 
 import argparse
 import base64
@@ -26,7 +27,6 @@ from pathlib import Path
 from typing import Optional
 
 import anthropic
-import fitz  # PyMuPDF
 
 # ─────────────────────────────────────────────
 # 설정 (Configuration)
@@ -103,6 +103,7 @@ class FigureTableEntry:
 
 def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> ExtractionResult:
     """PDF에서 텍스트와 이미지를 분리 추출"""
+    import fitz  # PyMuPDF — 실제 PDF 처리 시에만 임포트
     doc = fitz.open(pdf_path)
     result = ExtractionResult(full_text="", metadata={})
 
@@ -759,6 +760,23 @@ def main():
     elapsed = time.time() - start_time
     print(f"⏱️  총 소요 시간: {elapsed:.1f}초")
     print_summary(analyzer.result, extraction)
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """모델별 API 비용 추정 (USD)"""
+    if "sonnet" in model:
+        cost_in = input_tokens / 1_000_000 * 3
+        cost_out = output_tokens / 1_000_000 * 15
+    elif "opus" in model:
+        cost_in = input_tokens / 1_000_000 * 15
+        cost_out = output_tokens / 1_000_000 * 75
+    elif "haiku" in model:
+        cost_in = input_tokens / 1_000_000 * 0.25
+        cost_out = output_tokens / 1_000_000 * 1.25
+    else:
+        cost_in = input_tokens / 1_000_000 * 5
+        cost_out = output_tokens / 1_000_000 * 25
+    return cost_in + cost_out
 
 
 def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) -> str:
