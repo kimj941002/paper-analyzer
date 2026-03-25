@@ -765,6 +765,23 @@ def main():
     print_summary(analyzer.result, extraction)
 
 
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """모델별 API 비용 추정 (USD)"""
+    if "sonnet" in model:
+        cost_in = input_tokens / 1_000_000 * 3
+        cost_out = output_tokens / 1_000_000 * 15
+    elif "opus" in model:
+        cost_in = input_tokens / 1_000_000 * 15
+        cost_out = output_tokens / 1_000_000 * 75
+    elif "haiku" in model:
+        cost_in = input_tokens / 1_000_000 * 0.25
+        cost_out = output_tokens / 1_000_000 * 1.25
+    else:
+        cost_in = input_tokens / 1_000_000 * 5
+        cost_out = output_tokens / 1_000_000 * 25
+    return cost_in + cost_out
+
+
 def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) -> str:
     """최종 마크다운 보고서 구성"""
     sections = []
