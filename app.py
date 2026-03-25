@@ -278,6 +278,9 @@ with tab_analyze:
             args.model = model
 
             output_md = _build_output(analyzer.result, extraction, args)
+            total_in = analyzer.result.token_usage["input_tokens"]
+            total_out = analyzer.result.token_usage["output_tokens"]
+            cost = _estimate_cost(model, total_in, total_out)
 
             st.session_state.analysis_done = True
             st.session_state.analysis_result = analyzer.result
@@ -287,9 +290,31 @@ with tab_analyze:
             st.session_state.analysis_model = model
             st.session_state.analysis_lang = lang
             st.session_state.analysis_elapsed = elapsed
-            total_in = analyzer.result.token_usage["input_tokens"]
-            total_out = analyzer.result.token_usage["output_tokens"]
-            st.session_state.analysis_cost = _estimate_cost(model, total_in, total_out)
+            st.session_state.analysis_cost = cost
+
+            # ── Drive 자동 저장 ──
+            if _drive_ready:
+                with st.spinner("☁️ Google Drive / Sheets에 자동 저장 중..."):
+                    try:
+                        storage = DriveStorage(
+                            root_folder_id=drive_folder_id,
+                            sheet_id=drive_sheet_id,
+                            credentials_json=drive_creds_json,
+                        )
+                        save_result = storage.save(
+                            pdf_path=tmp_path,
+                            analysis_md=output_md,
+                            result=analyzer.result,
+                            model=model,
+                            lang=lang,
+                            cost=cost,
+                            doi=extraction.metadata.get("doi", ""),
+                            tags="",
+                        )
+                        st.session_state.drive_saved = True
+                        st.session_state.drive_save_result = save_result
+                    except Exception as e:
+                        st.warning(f"⚠️ 자동 저장 실패: {e}")
 
         finally:
             os.unlink(tmp_path)
@@ -342,7 +367,7 @@ with tab_analyze:
             else:
                 st.info("Figure 분석 결과가 없습니다.")
 
-        # ── 다운로드 + Drive 저장 버튼 ──
+        # ── 다운로드 + Drive 저장 상태 ──
         st.divider()
 
         dl_col, drive_col = st.columns(2)
@@ -359,42 +384,17 @@ with tab_analyze:
         with drive_col:
             if _drive_ready:
                 if st.session_state.drive_saved:
-                    st.success("✅ Google Drive에 저장 완료!")
+                    save_res = st.session_state.get("drive_save_result", {})
+                    if save_res.get("folder_link"):
+                        st.success(f"✅ 자동 저장 완료 — [Drive 폴더]({save_res['folder_link']})")
+                    else:
+                        st.success("✅ Sheets에 자동 저장 완료")
+                    # DOI 표시
+                    doi = st.session_state.extraction.metadata.get("doi", "")
+                    if doi:
+                        st.caption(f"DOI: `{doi}`")
                 else:
-                    drive_tags = st.text_input(
-                        "태그 (쉼표 구분, 선택사항)",
-                        placeholder="ML, NLP, Transformer",
-                        key="drive_tags_input",
-                    )
-                    if st.button("☁️ Google Drive에 저장", type="primary", use_container_width=True, key="save_to_drive"):
-                        # 임시 파일로 PDF 재생성 (Drive 업로드용)
-                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                            tmp.write(st.session_state.pdf_bytes)
-                            tmp_path = tmp.name
-
-                        try:
-                            with st.spinner("☁️ Google Drive에 저장 중..."):
-                                storage = DriveStorage(
-                                    root_folder_id=drive_folder_id,
-                                    sheet_id=drive_sheet_id,
-                                    credentials_json=drive_creds_json,
-                                )
-                                save_result = storage.save(
-                                    pdf_path=tmp_path,
-                                    analysis_md=st.session_state.output_md,
-                                    result=result,
-                                    model=st.session_state.analysis_model,
-                                    lang=st.session_state.analysis_lang,
-                                    cost=st.session_state.analysis_cost,
-                                    tags=drive_tags,
-                                )
-                            st.session_state.drive_saved = True
-                            st.success(f"✅ 저장 완료! — [Drive 폴더 열기]({save_result['folder_link']})")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Drive 저장 실패: {e}")
-                        finally:
-                            os.unlink(tmp_path)
+                    st.info("☁️ Drive 저장 미완료")
             else:
                 st.info("☁️ Drive 연결 미설정 — Secrets 확인 필요")
 
@@ -481,34 +481,23 @@ with tab_db:
                         if cost_usd:
                             st.write(f"**비용:** ${cost_usd}")
 
+                    doi = paper.get("doi", "")
+                    if doi:
+                        st.caption(f"DOI: [{doi}](https://doi.org/{doi})")
                     if tags:
                         st.write(f"**태그:** {tags}")
 
-                    # 링크 버튼
-                    link_cols = st.columns(3)
-                    with link_cols[0]:
-                        if pdf_link:
-                            st.link_button("📎 PDF 보기", pdf_link, use_container_width=True)
-                    with link_cols[1]:
-                        if analysis_link:
-                            st.link_button("📋 분석 결과 보기", analysis_link, use_container_width=True)
-                    with link_cols[2]:
-                        if folder_link:
-                            st.link_button("📁 Drive 폴더", folder_link, use_container_width=True)
+                    # Drive 링크 버튼 (있을 경우)
+                    if pdf_link or folder_link:
+                        link_cols = st.columns(2)
+                        with link_cols[0]:
+                            if pdf_link:
+                                st.link_button("📎 PDF 보기", pdf_link, use_container_width=True)
+                        with link_cols[1]:
+                            if folder_link:
+                                st.link_button("📁 Drive 폴더", folder_link, use_container_width=True)
 
-                    # 분석 내용 인라인 보기
-                    if analysis_link:
-                        _fid_match = re.search(r"/d/([a-zA-Z0-9_-]+)", analysis_link)
-                        if _fid_match:
-                            _file_id = _fid_match.group(1)
-                            if st.button("📖 분석 내용 펼치기", key=f"view_{paper.get('paper_id', title)}"):
-                                try:
-                                    storage = DriveStorage(
-                                        root_folder_id=drive_folder_id,
-                                        sheet_id=drive_sheet_id,
-                                        credentials_json=drive_creds_json,
-                                    )
-                                    md_content = storage.get_file_content(_file_id)
-                                    st.markdown(md_content)
-                                except Exception as e:
-                                    st.error(f"내용을 불러올 수 없습니다: {e}")
+                    # 분석 내용 — Sheets에서 직접 표시
+                    analysis_md = paper.get("analysis_md", "")
+                    if analysis_md:
+                        st.markdown(analysis_md)

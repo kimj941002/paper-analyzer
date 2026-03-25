@@ -146,9 +146,19 @@ def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> Extrac
 
     result.images = images[:max_images]
     result.metadata["manifest"] = manifest
+    result.metadata["doi"] = _extract_doi(result.full_text)
 
     doc.close()
     return result
+
+
+def _extract_doi(text: str) -> str:
+    """PDF 전문에서 DOI 추출"""
+    m = re.search(r'\b(10\.\d{4,}(?:\.\d+)*/\S+)', text)
+    if m:
+        doi = m.group(1).rstrip('.,;:)\\]>')
+        return doi
+    return ""
 
 
 def _build_figure_table_manifest(full_text: str) -> list[FigureTableEntry]:
