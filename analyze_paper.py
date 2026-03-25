@@ -26,10 +26,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import anthropic
-from dotenv import load_dotenv
-
-load_dotenv()  # .env 파일에서 환경변수 로드
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─────────────────────────────────────────────
 # 설정 (Configuration)
@@ -371,6 +372,8 @@ class PaperAnalyzer:
     """Claude API를 사용한 다단계 논문 분석"""
 
     def __init__(self, model: str = DEFAULT_MODEL, lang: str = "ko"):
+        import anthropic
+        self._anthropic = anthropic
         self.client = anthropic.Anthropic()  # ANTHROPIC_API_KEY 환경변수 사용
         self.model = model
         self.lang = lang
@@ -406,11 +409,11 @@ class PaperAnalyzer:
 
                 return response.content[0].text
 
-            except anthropic.RateLimitError:
+            except self._anthropic.RateLimitError:
                 wait = 2 ** attempt * 10
                 print(f"  ⏳ Rate limit — {wait}초 대기 후 재시도...")
                 time.sleep(wait)
-            except anthropic.APIError as e:
+            except self._anthropic.APIError as e:
                 print(f"  ❌ API 오류: {e}")
                 if attempt == 2:
                     raise
