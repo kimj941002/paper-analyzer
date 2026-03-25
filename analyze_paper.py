@@ -395,21 +395,21 @@ class PaperAnalyzer:
         messages: list[dict],
         max_tokens: int = MAX_OUTPUT_TOKENS,
     ) -> str:
-        """Claude API 호출 (재시도 로직 포함)"""
+        """Claude API 호출 — streaming 방식 (토큰 제한 없음, 타임아웃 안전)"""
         for attempt in range(3):
             try:
-                response = self.client.messages.create(
+                with self.client.messages.stream(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=messages,
-                )
-                # 토큰 사용량 누적
-                usage = response.usage
-                self.result.token_usage["input_tokens"] += usage.input_tokens
-                self.result.token_usage["output_tokens"] += usage.output_tokens
-
-                return response.content[0].text
+                ) as stream:
+                    text = stream.get_final_text()
+                    final_msg = stream.get_final_message()
+                    usage = final_msg.usage
+                    self.result.token_usage["input_tokens"] += usage.input_tokens
+                    self.result.token_usage["output_tokens"] += usage.output_tokens
+                    return text
 
             except self._anthropic.RateLimitError:
                 wait = 2 ** attempt * 10
