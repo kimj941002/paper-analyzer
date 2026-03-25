@@ -13,6 +13,7 @@ Claude API를 통해 단계적으로 분석하는 스크립트.
     python analyze_paper.py paper.pdf --model claude-opus-4-6 --lang ko
     python analyze_paper.py paper.pdf --output result.md --lang en
 """
+from __future__ import annotations
 
 import argparse
 import base64
@@ -26,7 +27,9 @@ from pathlib import Path
 from typing import Optional
 
 import anthropic
-import fitz  # PyMuPDF
+from dotenv import load_dotenv
+
+load_dotenv()  # .env 파일에서 환경변수 로드
 
 # ─────────────────────────────────────────────
 # 설정 (Configuration)
@@ -103,6 +106,7 @@ class FigureTableEntry:
 
 def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> ExtractionResult:
     """PDF에서 텍스트와 이미지를 분리 추출"""
+    import fitz  # PyMuPDF — 실제 PDF 처리 시에만 임포트
     doc = fitz.open(pdf_path)
     result = ExtractionResult(full_text="", metadata={})
 
