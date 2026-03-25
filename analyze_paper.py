@@ -22,10 +22,9 @@ import os
 import re
 import sys
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 from dotenv import load_dotenv
@@ -42,14 +41,6 @@ SYNTHESIS_MAX_TOKENS = 32000       # 종합 단계는 더 길게
 IMAGE_MIN_SIZE = (80, 80)          # 최소 이미지 크기 (px) — 로고/아이콘 제외
 IMAGE_MAX_COUNT = 30               # 최대 추출 이미지 수
 IMAGE_DPI = 200                    # 이미지 렌더링 해상도
-FIGURE_CONCURRENCY = 4             # Figure 병렬 분석 수
-
-# 모델별 비용 ($/MTok) — input, output
-MODEL_PRICING = {
-    "sonnet": (3, 15),
-    "opus":   (15, 75),
-    "haiku":  (0.25, 1.25),
-}
 
 # ─────────────────────────────────────────────
 # 데이터 구조
@@ -66,7 +57,6 @@ class ExtractedImage:
     height: int
     caption: str = ""
     context: str = ""  # 본문에서 해당 figure를 언급하는 문맥
-    figure_number: str = ""  # 매칭된 Figure/Table 번호 (예: "1", "2A")
 
 
 @dataclass
@@ -83,7 +73,6 @@ class AnalysisResult:
     text_analysis: str = ""
     figure_analyses: list[dict] = field(default_factory=list)
     synthesis: str = ""
-    model: str = ""
     token_usage: dict = field(default_factory=lambda: {
         "input_tokens": 0, "output_tokens": 0
     })
@@ -92,6 +81,28 @@ class AnalysisResult:
 # ─────────────────────────────────────────────
 # Stage 1: PDF 전처리
 # ─────────────────────────────────────────────
+#
+# 전략: "캡션 기반 전수 추출"
+#
+# 기존 문제: get_images()로 내장 이미지 객체만 추출하면
+#   - 벡터 기반 그래프, 텍스트 기반 테이블이 누락됨
+#   - 하나의 Figure가 여러 이미지 조각으로 분해됨
+#
+# 해결: 텍스트에서 Figure/Table 캡션을 먼저 전수 탐색하고,
+#       해당 캡션이 있는 페이지를 통째로 렌더링한다.
+#   → PDF 내부 구조에 무관하게 모든 Figure/Table 확보
+# ─────────────────────────────────────────────
+
+@dataclass
+class FigureTableEntry:
+    """텍스트에서 탐지된 Figure/Table 항목"""
+    label: str          # "Figure 1", "Table 2" 등
+    fig_type: str       # "figure" or "table"
+    number: str         # "1", "2A" 등
+    caption: str        # 전체 캡션 텍스트
+    page_num: int       # 캡션이 위치한 페이지 (1-indexed)
+    context: str = ""   # 본문에서 언급하는 문맥
+
 
 def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> ExtractionResult:
     """PDF에서 텍스트와 이미지를 분리 추출"""
@@ -110,118 +121,227 @@ def extract_from_pdf(pdf_path: str, max_images: int = IMAGE_MAX_COUNT) -> Extrac
 
     # ── 텍스트 추출 (페이지별) ──
     page_texts = []
+    page_text_map = {}  # page_num(0-indexed) -> text
     for page_num, page in enumerate(doc):
         text = page.get_text("text")
         if text.strip():
             page_texts.append(f"[Page {page_num + 1}]\n{text}")
+            page_text_map[page_num] = text
     result.full_text = "\n\n".join(page_texts)
 
-    # ── 이미지 추출 (하이브리드: 내장 + 페이지 렌더링) ──
-    embedded = _extract_embedded_images(doc)
+    # ── Step A: 캡션 전수 탐색 — Figure/Table 매니페스트 구축 ──
+    manifest = _build_figure_table_manifest(result.full_text)
+    print(f"  📋 탐지된 Figure/Table: {len(manifest)}개")
+    for entry in manifest:
+        print(f"     {entry.label} (p.{entry.page_num})")
 
-    # 본문에서 Figure/Table 번호 목록 추출
-    fig_numbers_in_text = set(re.findall(
-        r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+)',
-        result.full_text, re.IGNORECASE
-    ))
+    # ── Step B: 매니페스트 기반 페이지 렌더링 ──
+    images = _render_manifest_pages(doc, manifest, max_images)
 
-    # 내장 이미지가 있는 페이지 기록
-    embedded_pages = {img.page_num for img in embedded}
-
-    # Figure/Table 캡션이 있지만 내장 이미지가 없는 페이지를 렌더링
-    rendered = _extract_page_renders(doc, skip_pages=embedded_pages)
-
-    # 합산: 내장 이미지 + 누락 페이지 렌더링
-    images = embedded + rendered
-    # index 재정렬 (페이지 순)
-    images.sort(key=lambda img: (img.page_num, img.index))
-    for i, img in enumerate(images):
-        img.index = i + 1
+    # ── Step C: 매니페스트에 없는 시각 요소 보완 (Supplementary 등) ──
+    rendered_pages = {img.page_num for img in images}
+    extra = _render_visual_pages(doc, rendered_pages, max_images - len(images))
+    images.extend(extra)
 
     result.images = images[:max_images]
-
-    # ── Figure caption 매칭 ──
-    _match_captions(result)
+    result.metadata["manifest"] = manifest
 
     doc.close()
     return result
 
 
-def _extract_embedded_images(doc: fitz.Document) -> list[ExtractedImage]:
-    """PDF에 내장된 이미지 객체 직접 추출"""
+def _build_figure_table_manifest(full_text: str) -> list[FigureTableEntry]:
+    """전체 텍스트에서 모든 Figure/Table 캡션을 탐지하여 매니페스트 구축"""
+
+    # 캡션 패턴: Figure/Fig/Table/Scheme/Chart + 번호 + 명시적 구분자(. : – —) + 설명
+    # 주의: 단순 공백은 구분자로 인정하지 않음 (본문 언급과 캡션 구분)
+    caption_pattern = re.compile(
+        r'((?:Figure|Fig\.?|Table|Scheme|Chart|Supplementary\s+(?:Figure|Fig\.?|Table))'
+        r'\s*\.?\s*'
+        r'(S?\d+[A-Za-z]?(?:\s*[-–—]\s*[A-Za-z])?)'  # "2A-C" 같은 패널 범위 포함
+        r'\s*[.:–—|]\s*'  # 명시적 구분자 필수 (공백만으로는 불가)
+        r'([^\n]{5,}))',
+        re.IGNORECASE
+    )
+
+    # 본문에서 Figure/Table 언급 문맥 추출
+    context_pattern = re.compile(
+        r'([^.]*(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*S?\d+[A-Za-z]?[^.]*\.)',
+        re.IGNORECASE
+    )
+    all_contexts = context_pattern.findall(full_text)
+
+    # 페이지별 텍스트 분할
+    page_splits = re.split(r'\[Page (\d+)\]\n', full_text)
+
+    manifest = []
+    seen_labels = set()
+
+    for match in caption_pattern.finditer(full_text):
+        full_cap = match.group(1).strip()
+        number = match.group(2).strip()
+        description = match.group(3).strip()
+
+        # Figure vs Table 구분
+        cap_lower = full_cap.lower()
+        if "table" in cap_lower:
+            fig_type = "table"
+        else:
+            fig_type = "figure"
+
+        # 표준화된 라벨 생성
+        type_word = "Table" if fig_type == "table" else "Figure"
+        if "supplementary" in cap_lower:
+            type_word = f"Supplementary {type_word}"
+        label = f"{type_word} {number}"
+
+        # 중복 제거
+        if label.lower() in seen_labels:
+            continue
+        seen_labels.add(label.lower())
+
+        # 캡션 위치의 페이지 번호 찾기
+        cap_pos = match.start()
+        page_num = _find_page_at_position(full_text, cap_pos)
+
+        # 본문 언급 문맥 수집 — 타입(Figure/Table)과 번호 모두 일치해야 함
+        related = []
+        type_keywords = ("table",) if fig_type == "table" else ("figure", "fig")
+        for ctx in all_contexts:
+            ctx_lower = ctx.lower()
+            # 해당 타입의 키워드가 있는지 확인
+            has_type = any(kw in ctx_lower for kw in type_keywords)
+            if not has_type:
+                continue
+            # 해당 번호를 언급하는지 확인
+            ctx_nums = re.findall(
+                r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(S?\d+[A-Za-z]?)',
+                ctx, re.IGNORECASE
+            )
+            # 번호의 숫자 부분만 비교 (2A → 2, S1 → S1)
+            number_base = re.match(r'(S?\d+)', number).group(1) if number else ""
+            matched = any(
+                re.match(r'(S?\d+)', n).group(1) == number_base
+                for n in ctx_nums
+                if re.match(r'(S?\d+)', n)
+            )
+            if matched:
+                ctx_clean = ctx.strip()
+                if ctx_clean != full_cap and ctx_clean not in related:
+                    related.append(ctx_clean)
+
+        manifest.append(FigureTableEntry(
+            label=label,
+            fig_type=fig_type,
+            number=number,
+            caption=full_cap,
+            page_num=page_num,
+            context=" ".join(related[:8]),
+        ))
+
+    # 페이지 순서로 정렬
+    manifest.sort(key=lambda e: (e.page_num, e.number))
+    return manifest
+
+
+def _find_page_at_position(full_text: str, position: int) -> int:
+    """텍스트 내 특정 위치가 어떤 페이지에 해당하는지 찾기"""
+    page_markers = list(re.finditer(r'\[Page (\d+)\]', full_text))
+    current_page = 1
+    for marker in page_markers:
+        if marker.start() <= position:
+            current_page = int(marker.group(1))
+        else:
+            break
+    return current_page
+
+
+def _render_manifest_pages(
+    doc: fitz.Document,
+    manifest: list[FigureTableEntry],
+    max_images: int,
+) -> list[ExtractedImage]:
+    """매니페스트에 등재된 Figure/Table이 있는 페이지를 렌더링"""
     images = []
-    seen_xrefs = set()
 
-    for page_num, page in enumerate(doc):
-        image_list = page.get_images(full=True)
-        for img_info in image_list:
-            xref = img_info[0]
-            if xref in seen_xrefs:
-                continue
-            seen_xrefs.add(xref)
+    # 동일 페이지에 여러 Figure가 있을 수 있으므로 페이지별로 그룹핑
+    page_to_entries: dict[int, list[FigureTableEntry]] = {}
+    for entry in manifest:
+        pg = entry.page_num
+        if pg not in page_to_entries:
+            page_to_entries[pg] = []
+        page_to_entries[pg].append(entry)
 
-            try:
-                base_image = doc.extract_image(xref)
-                if not base_image:
-                    continue
+    for page_num_1indexed in sorted(page_to_entries.keys()):
+        if len(images) >= max_images:
+            break
 
-                img_bytes = base_image["image"]
-                ext = base_image.get("ext", "png")
-                w = base_image.get("width", 0)
-                h = base_image.get("height", 0)
+        page_idx = page_num_1indexed - 1
+        if page_idx < 0 or page_idx >= len(doc):
+            continue
 
-                # 너무 작은 이미지 필터링 (아이콘, 로고 등)
-                if w < IMAGE_MIN_SIZE[0] or h < IMAGE_MIN_SIZE[1]:
-                    continue
+        entries = page_to_entries[page_num_1indexed]
+        page = doc[page_idx]
 
-                media_type = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else 'png'}"
-                b64 = base64.b64encode(img_bytes).decode("utf-8")
+        # 페이지 전체를 고해상도로 렌더링
+        mat = fitz.Matrix(IMAGE_DPI / 72, IMAGE_DPI / 72)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-                images.append(ExtractedImage(
-                    index=len(images) + 1,
-                    page_num=page_num + 1,
-                    base64_data=b64,
-                    media_type=media_type,
-                    width=w,
-                    height=h,
-                ))
-            except Exception:
-                continue
+        # 이 페이지의 모든 Figure/Table 캡션과 문맥을 합산
+        combined_captions = []
+        combined_contexts = []
+        combined_labels = []
+        for entry in entries:
+            combined_labels.append(entry.label)
+            combined_captions.append(entry.caption)
+            if entry.context:
+                combined_contexts.append(entry.context)
+
+        images.append(ExtractedImage(
+            index=len(images) + 1,
+            page_num=page_num_1indexed,
+            base64_data=b64,
+            media_type="image/png",
+            width=pix.width,
+            height=pix.height,
+            caption=" | ".join(combined_captions),
+            context=" ".join(combined_contexts),
+        ))
 
     return images
 
 
-def _extract_page_renders(
+def _render_visual_pages(
     doc: fitz.Document,
-    skip_pages: set[int] | None = None,
+    already_rendered: set[int],
+    remaining_slots: int,
 ) -> list[ExtractedImage]:
-    """Figure/Table 캡션이 있는 페이지를 이미지로 렌더링.
-
-    skip_pages: 이미 내장 이미지가 추출된 페이지 번호(1-based) — 중복 방지
-    """
-    if skip_pages is None:
-        skip_pages = set()
-
-    # Figure/Table 캡션 패턴
-    caption_pattern = re.compile(
-        r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*\d+',
-        re.IGNORECASE,
-    )
+    """매니페스트에 없지만 시각 요소가 있는 페이지를 추가 렌더링
+    (Supplementary figure, 캡션 없는 도식 등 보완)"""
+    if remaining_slots <= 0:
+        return []
 
     images = []
-    for page_num, page in enumerate(doc):
-        pnum = page_num + 1
-        if pnum in skip_pages:
+    for page_idx, page in enumerate(doc):
+        page_num = page_idx + 1
+        if page_num in already_rendered:
             continue
+        if len(images) >= remaining_slots:
+            break
 
-        page_text = page.get_text("text")
-
-        # 이 페이지에 Figure/Table 캡션이 있거나, 이미지 블록이 있으면 렌더링
-        has_caption = bool(caption_pattern.search(page_text))
+        # 이 페이지에 이미지 블록이 있는지 확인
         blocks = page.get_text("dict")["blocks"]
-        has_image_block = any(b.get("type") == 1 for b in blocks)
+        image_blocks = [b for b in blocks if b.get("type") == 1]
 
-        if not has_caption and not has_image_block:
+        # 텍스트 대비 이미지 비율이 높은 페이지만 (figure-heavy page)
+        text = page.get_text("text").strip()
+        if not image_blocks:
+            continue
+        # 텍스트가 매우 적고 이미지가 있으면 → figure 전용 페이지일 가능성
+        # 또는 이미지 블록이 3개 이상이면 → figure가 있을 가능성
+        if len(text) > 500 and len(image_blocks) < 3:
             continue
 
         mat = fitz.Matrix(IMAGE_DPI / 72, IMAGE_DPI / 72)
@@ -230,85 +350,17 @@ def _extract_page_renders(
         b64 = base64.b64encode(img_bytes).decode("utf-8")
 
         images.append(ExtractedImage(
-            index=len(images) + 1,
-            page_num=pnum,
+            index=0,  # 나중에 재번호 매김
+            page_num=page_num,
             base64_data=b64,
             media_type="image/png",
             width=pix.width,
             height=pix.height,
+            caption="(캡션 매칭 없음 — 추가 탐지된 시각 요소)",
+            context="",
         ))
 
     return images
-
-
-def _get_page_text(full_text: str, page_num: int) -> str:
-    """전체 텍스트에서 특정 페이지의 텍스트를 추출"""
-    marker = f"[Page {page_num}]"
-    start = full_text.find(marker)
-    if start == -1:
-        return ""
-    end = full_text.find("[Page", start + 1)
-    return full_text[start:end] if end != -1 else full_text[start:]
-
-
-def _match_captions(result: ExtractionResult):
-    """Figure/Table caption을 이미지에 매칭하고, 본문 문맥 추출
-
-    매칭 전략: 각 이미지가 위치한 페이지(±1)에서 발견되는 캡션을 순서대로 매칭.
-    캡션의 figure 번호를 이미지에 기록하여, 본문 문맥 검색 시 정확한 번호를 사용.
-    """
-    text = result.full_text
-
-    # Figure/Table 캡션 패턴
-    caption_pattern = re.compile(
-        r'((?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+[A-Za-z]?)[\s.:–—-]+[^\n]{5,})',
-        re.IGNORECASE
-    )
-    all_captions = caption_pattern.findall(text)  # [(full_caption, fig_num), ...]
-
-    # 본문에서 figure 언급 문맥 추출
-    context_pattern = re.compile(
-        r'([^.]*(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*\d+[A-Za-z]?[^.]*\.)',
-        re.IGNORECASE
-    )
-    all_contexts = context_pattern.findall(text)
-
-    # 이미 사용된 캡션을 추적하여 중복 매칭 방지
-    used_captions = set()
-
-    for img in result.images:
-        # 해당 페이지 ± 1 범위의 텍스트에서 캡션 탐색
-        nearby_text = ""
-        for p in [img.page_num, img.page_num - 1, img.page_num + 1]:
-            nearby_text += _get_page_text(text, p) + "\n"
-
-        best_caption = ""
-        best_fig_num = ""
-        for full_cap, fig_num in all_captions:
-            if fig_num in used_captions:
-                continue
-            if full_cap in nearby_text:
-                best_caption = full_cap.strip()
-                best_fig_num = fig_num
-                used_captions.add(fig_num)
-                break
-
-        img.caption = best_caption
-        img.figure_number = best_fig_num
-
-        # 관련 문맥 수집 — figure_number 기반으로 정확한 매칭
-        search_num = best_fig_num if best_fig_num else str(img.index)
-        related_contexts = []
-        for ctx in all_contexts:
-            nums = re.findall(
-                r'(?:Figure|Fig\.?|Table|Scheme|Chart)\s*\.?\s*(\d+)',
-                ctx, re.IGNORECASE
-            )
-            # figure_number의 숫자 부분으로 매칭 (예: "2A" → "2")
-            base_num = re.match(r'(\d+)', search_num)
-            if base_num and base_num.group(1) in nums:
-                related_contexts.append(ctx.strip())
-        img.context = " ".join(related_contexts[:5])
 
 
 # ─────────────────────────────────────────────
@@ -318,14 +370,11 @@ def _match_captions(result: ExtractionResult):
 class PaperAnalyzer:
     """Claude API를 사용한 다단계 논문 분석"""
 
-    def __init__(self, model: str = DEFAULT_MODEL, lang: str = "ko",
-                 cache_dir: Path | None = None):
-        self.client = anthropic.Anthropic()
+    def __init__(self, model: str = DEFAULT_MODEL, lang: str = "ko"):
+        self.client = anthropic.Anthropic()  # ANTHROPIC_API_KEY 환경변수 사용
         self.model = model
         self.lang = lang
-        self.result = AnalysisResult(model=model)
-        self.cache_dir = cache_dir
-        self._token_lock = threading.Lock()
+        self.result = AnalysisResult()
 
     def _lang_instruction(self) -> str:
         if self.lang == "ko":
@@ -341,31 +390,21 @@ class PaperAnalyzer:
         messages: list[dict],
         max_tokens: int = MAX_OUTPUT_TOKENS,
     ) -> str:
-        """Claude API 호출 — 스트리밍 모드 (재시도 로직 포함)"""
+        """Claude API 호출 (재시도 로직 포함)"""
         for attempt in range(3):
             try:
-                result_chunks: list[str] = []
-                input_tokens = 0
-                output_tokens = 0
-
-                with self.client.messages.stream(
+                response = self.client.messages.create(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=messages,
-                ) as stream:
-                    for text in stream.text_stream:
-                        result_chunks.append(text)
+                )
+                # 토큰 사용량 누적
+                usage = response.usage
+                self.result.token_usage["input_tokens"] += usage.input_tokens
+                self.result.token_usage["output_tokens"] += usage.output_tokens
 
-                resp = stream.get_final_message()
-                input_tokens = resp.usage.input_tokens
-                output_tokens = resp.usage.output_tokens
-
-                with self._token_lock:
-                    self.result.token_usage["input_tokens"] += input_tokens
-                    self.result.token_usage["output_tokens"] += output_tokens
-
-                return "".join(result_chunks)
+                return response.content[0].text
 
             except anthropic.RateLimitError:
                 wait = 2 ** attempt * 10
@@ -379,37 +418,13 @@ class PaperAnalyzer:
 
         return ""
 
-    def _save_cache(self, stage: str, data: str | list):
-        """중간 결과를 캐시 파일로 저장"""
-        if not self.cache_dir:
-            return
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = self.cache_dir / f"{stage}.json"
-        cache_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _load_cache(self, stage: str) -> str | list | None:
-        """캐시된 중간 결과 로드"""
-        if not self.cache_dir:
-            return None
-        cache_file = self.cache_dir / f"{stage}.json"
-        if cache_file.exists():
-            content = json.loads(cache_file.read_text(encoding="utf-8"))
-            print(f"  ♻️  캐시 로드: {stage}")
-            return content
-        return None
-
     # ── Stage 2: 텍스트 분석 ──
 
     def analyze_text(self, extraction: ExtractionResult) -> str:
         """전체 텍스트 기반 논문 구조 분석"""
         print("\n📄 [Stage 2/4] 텍스트 분석 중...")
 
-        cached = self._load_cache("stage2_text")
-        if cached:
-            self.result.text_analysis = cached
-            return cached
-
-        system = f"""당신은 과학/공학 전 분야의 논문 분석 전문가입니다.
+        system = f"""당신은 생명과학/구조생물학/제약 분야의 논문 분석 전문가입니다.
 첨부된 논문 텍스트를 정밀하게 분석하세요.
 
 {self._lang_instruction()}
@@ -437,25 +452,18 @@ class PaperAnalyzer:
         }]
 
         self.result.text_analysis = self._call_api(system, messages)
-        self._save_cache("stage2_text", self.result.text_analysis)
         print("  ✅ 텍스트 분석 완료")
         return self.result.text_analysis
 
-    # ── Stage 3: Figure/Table 개별 분석 (병렬) ──
+    # ── Stage 3: Figure/Table 개별 분석 ──
 
     def analyze_figures(self, extraction: ExtractionResult) -> list[dict]:
-        """각 Figure/Table 이미지를 병렬로 분석"""
+        """각 Figure/Table 이미지를 개별 분석"""
         if not extraction.images:
             print("\n🖼️  [Stage 3/4] 추출된 이미지 없음 — 건너뜀")
             return []
 
-        cached = self._load_cache("stage3_figures")
-        if cached:
-            self.result.figure_analyses = cached
-            return cached
-
-        n = len(extraction.images)
-        print(f"\n🖼️  [Stage 3/4] Figure/Table 분석 중... ({n}개, 병렬 {FIGURE_CONCURRENCY})")
+        print(f"\n🖼️  [Stage 3/4] Figure/Table 분석 중... ({len(extraction.images)}개)")
 
         system = f"""당신은 과학 논문의 Figure/Table 분석 전문가입니다.
 제공되는 이미지를 정밀하게 분석하세요.
@@ -477,12 +485,11 @@ class PaperAnalyzer:
 - 읽을 수 있는 텍스트/숫자는 정확히 옮기세요.
 - 불확실한 부분은 [불확실] 표시를 하세요."""
 
-        analyses = [None] * n  # 순서 보존용 슬롯
+        analyses = []
+        for img in extraction.images:
+            print(f"  🔍 이미지 {img.index}/{len(extraction.images)} (p.{img.page_num}) 분석 중...")
 
-        def _analyze_one(idx: int, img: ExtractedImage) -> dict:
-            label = f"Fig.{img.figure_number}" if img.figure_number else f"Image {img.index}"
-            print(f"  🔍 {label} (p.{img.page_num}) 분석 중...")
-
+            # 이미지 + 캡션 + 본문 문맥을 함께 전달
             content_blocks = [
                 {
                     "type": "image",
@@ -499,55 +506,31 @@ class PaperAnalyzer:
             ]
 
             messages = [{"role": "user", "content": content_blocks}]
+
             analysis_text = self._call_api(system, messages)
-            result = {
+            analyses.append({
                 "image_index": img.index,
-                "figure_number": img.figure_number,
                 "page": img.page_num,
                 "caption": img.caption,
                 "analysis": analysis_text,
-            }
-            print(f"  ✅ {label} 완료")
-            return result
+            })
+            print(f"  ✅ 이미지 {img.index} 완료")
 
-        with ThreadPoolExecutor(max_workers=FIGURE_CONCURRENCY) as executor:
-            futures = {
-                executor.submit(_analyze_one, i, img): i
-                for i, img in enumerate(extraction.images)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    analyses[idx] = future.result()
-                except Exception as e:
-                    img = extraction.images[idx]
-                    print(f"  ⚠️  Image {img.index} 분석 실패: {e}")
-                    analyses[idx] = {
-                        "image_index": img.index,
-                        "figure_number": img.figure_number,
-                        "page": img.page_num,
-                        "caption": img.caption,
-                        "analysis": f"[분석 실패: {e}]",
-                    }
-
-        self.result.figure_analyses = [a for a in analyses if a is not None]
-        self._save_cache("stage3_figures", self.result.figure_analyses)
-        return self.result.figure_analyses
+        self.result.figure_analyses = analyses
+        return analyses
 
     def _build_figure_prompt(self, img: ExtractedImage) -> str:
         """Figure 분석을 위한 프롬프트 구성"""
-        parts = [f"이 이미지는 논문의 {img.page_num}페이지에 위치합니다."]
-
-        if img.figure_number:
-            parts.append(f"Figure/Table 번호: {img.figure_number}")
+        parts = [f"이 이미지는 논문의 {img.page_num}페이지를 렌더링한 것입니다."]
+        parts.append("이 페이지에 포함된 모든 Figure, Table, 그래프, 도식을 빠짐없이 분석하세요.")
 
         if img.caption:
-            parts.append(f"\n캡션(Caption): {img.caption}")
+            parts.append(f"\n이 페이지의 캡션(들): {img.caption}")
 
         if img.context:
-            parts.append(f"\n본문에서 이 Figure를 언급하는 문맥:\n{img.context}")
+            parts.append(f"\n본문에서 이 Figure/Table을 언급하는 문맥:\n{img.context}")
 
-        parts.append("\n위 이미지를 상세히 분석해주세요.")
+        parts.append("\n위 이미지를 상세히 분석해주세요. 패널(A, B, C 등)이 있으면 각각 분석하세요.")
         return "\n".join(parts)
 
     # ── Stage 4: 종합 ──
@@ -561,26 +544,33 @@ class PaperAnalyzer:
         if self.result.figure_analyses:
             parts = []
             for fa in self.result.figure_analyses:
-                fig_label = f"Figure {fa.get('figure_number', '')}" if fa.get('figure_number') else f"Image {fa['image_index']}"
-                header = f"### {fig_label} (p.{fa['page']})"
+                header = f"### Page {fa['page']} 분석"
                 if fa["caption"]:
-                    header += f"\nCaption: {fa['caption']}"
+                    header += f"\n포함된 Figure/Table: {fa['caption']}"
                 parts.append(f"{header}\n{fa['analysis']}")
             figure_summary = "\n\n".join(parts)
 
-        system = f"""당신은 과학 논문의 내용을 정확하게 정리하는 전문가입니다.
-아래에 제공되는 텍스트 분석과 Figure/Table 분석 결과를 하나로 통합하여,
-논문의 내용을 충실히 전달하는 완성된 보고서를 작성하세요.
+        system = f"""당신은 과학 논문의 내용을 정확히 전달하는 전문 리포터입니다.
+아래에 여러 경로로 수집된 정보(텍스트 추출 결과, 이미지 관찰 결과)가 제공됩니다.
+이것들은 **하나의 논문에서 나온 동일한 내용의 서로 다른 표현**입니다.
+
+당신의 임무: 이 모든 정보를 재료로 삼아, 마치 이 논문을 처음부터 직접 읽고
+완벽히 이해한 사람이 쓴 것처럼 **하나의 통합된 분석 보고서**를 작성하세요.
 
 {self._lang_instruction()}
 
-■ 핵심 원칙:
-- 텍스트와 Figure/Table 분석은 같은 논문의 서로 다른 측면을 다룬 것입니다.
-  이를 하나의 매끄러운 보고서로 통합하세요.
-- 두 분석 간의 차이점을 지적하거나 비교하지 마세요.
-  논문 원문의 내용을 정확히 전달하는 데만 집중하세요.
-- Figure/Table의 데이터와 텍스트의 설명을 자연스럽게 결합하여
-  각 결과 섹션에서 함께 기술하세요.
+■ 절대 하지 말아야 할 것:
+- "텍스트 분석에서는 ~했고, 이미지 분석에서는 ~했다" 식의 분석 과정 서술 금지
+- "두 분석 간 불일치가 있다", "A에서는 확인되지 않았다" 등 메타 비교 금지
+- 분석 단계, 파이프라인, 수집 방법에 대한 언급 일체 금지
+- 당신은 원본 논문만 읽은 것처럼 서술해야 합니다
+
+■ 반드시 해야 할 것:
+- 모든 Figure, Table의 내용을 해당 결과 섹션에 자연스럽게 통합
+  (예: "Figure 3A에서 보듯이, cMET의 인산화는 ~" 식으로 논문 저자가 쓰듯 서술)
+- 수치 데이터가 여러 소스에서 확인되면 가장 구체적인 값을 채택
+- 텍스트에서만 언급된 정보도, 이미지에서만 관찰된 정보도 빠짐없이 포함
+- Figure/Table이 보여주는 데이터를 결과 해석의 근거로 직접 인용
 
 ■ 출력 양식 (반드시 준수):
 
@@ -601,8 +591,7 @@ class PaperAnalyzer:
 
 ## 3. 주요 결과
 ### 3.1 [결과 주제 1]
-  - 텍스트 설명과 해당 Figure/Table 데이터를 통합하여 기술
-  - 핵심 수치 데이터
+  (Figure/Table 데이터를 본문에 자연스럽게 통합하여 기술)
 ### 3.2 [결과 주제 2]
   ...
 
@@ -618,31 +607,30 @@ class PaperAnalyzer:
 
 ## 6. 핵심 요약 (3-5문장)
 
+## 7. 비판적 검토
+(방법론의 적절성, 결론의 논리적 타당성, 잠재적 한계에 대한 분석자의 의견)"""
+
+        user_content = f"""다음은 논문에서 수집된 모든 정보입니다.
+
 ---
-
-■ 작성 지침:
-- "텍스트 분석에서는~", "Figure 분석에서는~" 같은 메타 표현을 사용하지 마세요.
-  마치 논문을 직접 읽고 정리한 것처럼 작성하세요.
-- 수치 데이터(IC50, Kd, 해상도, p-value 등)는 정확히 기록하세요.
-- 모든 Figure와 Table의 핵심 데이터를 해당 결과 섹션에 자연스럽게 포함하세요.
-- 논문에 명시적으로 기술된 내용만 작성하고, 추측은 피하세요."""
-
-        user_content = f"""## A. 텍스트 분석 결과
+[텍스트에서 추출된 내용]
 
 {self.result.text_analysis}
 
-## B. Figure/Table 분석 결과
+---
+[Figure/Table 이미지에서 관찰된 내용]
 
-{figure_summary if figure_summary else "(추출된 Figure/Table 없음)"}
+{figure_summary if figure_summary else "(해당 없음)"}
 
-위 내용을 통합하여 논문의 내용을 정확히 전달하는 최종 보고서를 작성하세요.
-두 분석 소스 간의 비교나 차이점 언급 없이, 하나의 완성된 논문 분석으로 작성하세요."""
+---
+
+위 정보를 모두 활용하여 이 논문의 통합 분석 보고서를 작성하세요.
+분석 과정이나 정보 수집 방법은 언급하지 마세요."""
 
         messages = [{"role": "user", "content": user_content}]
         self.result.synthesis = self._call_api(
             system, messages, max_tokens=SYNTHESIS_MAX_TOKENS
         )
-        self._save_cache("stage4_synthesis", self.result.synthesis)
         print("  ✅ 종합 분석 완료")
         return self.result.synthesis
 
@@ -650,16 +638,6 @@ class PaperAnalyzer:
 # ─────────────────────────────────────────────
 # 메인 실행
 # ─────────────────────────────────────────────
-
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """모델명에서 가격 티어를 추출하여 비용 추정"""
-    for tier, (price_in, price_out) in MODEL_PRICING.items():
-        if tier in model:
-            return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
-    # 알 수 없는 모델은 sonnet 기준
-    price_in, price_out = MODEL_PRICING["sonnet"]
-    return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
-
 
 def print_summary(result: AnalysisResult, extraction: ExtractionResult):
     """실행 요약 출력"""
@@ -669,15 +647,20 @@ def print_summary(result: AnalysisResult, extraction: ExtractionResult):
     print("\n" + "=" * 60)
     print("📈 분석 완료 요약")
     print("=" * 60)
-    print(f"  모델: {result.model}")
     print(f"  논문 페이지 수: {extraction.metadata.get('pages', '?')}")
     print(f"  추출 텍스트 길이: {len(extraction.full_text):,} 문자")
     print(f"  추출 이미지 수: {len(extraction.images)}")
     print(f"  총 입력 토큰: {total_in:,}")
     print(f"  총 출력 토큰: {total_out:,}")
 
-    cost = _estimate_cost(result.model, total_in, total_out)
-    print(f"  예상 비용: ~${cost:.3f}")
+    # 비용 추정 (Sonnet 4.6 기준: $3/$15 per MTok)
+    if "sonnet" in DEFAULT_MODEL or "sonnet" in str(result):
+        cost_in = total_in / 1_000_000 * 3
+        cost_out = total_out / 1_000_000 * 15
+    else:
+        cost_in = total_in / 1_000_000 * 5
+        cost_out = total_out / 1_000_000 * 25
+    print(f"  예상 비용: ~${cost_in + cost_out:.3f}")
     print("=" * 60)
 
 
@@ -691,7 +674,6 @@ def main():
   python analyze_paper.py paper.pdf --model claude-opus-4-6
   python analyze_paper.py paper.pdf --output result.md --lang en
   python analyze_paper.py paper.pdf --text-only
-  python analyze_paper.py paper.pdf --resume        # 이전 중단 지점부터 재개
         """
     )
     parser.add_argument("pdf", help="분석할 PDF 파일 경로")
@@ -715,14 +697,6 @@ def main():
         "--max-images", type=int, default=IMAGE_MAX_COUNT,
         help=f"최대 분석 이미지 수 (기본: {IMAGE_MAX_COUNT})"
     )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="이전 중단 지점부터 재개 (캐시 활용)"
-    )
-    parser.add_argument(
-        "--no-cache", action="store_true",
-        help="캐시를 사용하지 않고 처음부터 분석"
-    )
 
     args = parser.parse_args()
 
@@ -738,12 +712,12 @@ def main():
         sys.exit(1)
 
     # 출력 경로
-    output_path = Path(args.output) if args.output else pdf_path.with_suffix(".analysis.md")
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = pdf_path.with_suffix(".analysis.md")
 
-    # 캐시 디렉토리
-    cache_dir = None
-    if not args.no_cache:
-        cache_dir = pdf_path.parent / f".{pdf_path.stem}_cache"
+    max_images = args.max_images
 
     # ── 실행 ──
     print("=" * 60)
@@ -751,23 +725,28 @@ def main():
     print(f"   파일: {pdf_path.name}")
     print(f"   모델: {args.model}")
     print(f"   언어: {args.lang}")
-    if cache_dir:
-        print(f"   캐시: {cache_dir}")
     print("=" * 60)
 
     start_time = time.time()
 
     # Stage 1: PDF 전처리
     print("\n📦 [Stage 1/4] PDF 전처리 중...")
-    extraction = extract_from_pdf(str(pdf_path), max_images=args.max_images)
-    print(f"  ✅ 텍스트: {len(extraction.full_text):,}자 / 이미지: {len(extraction.images)}개")
+    extraction = extract_from_pdf(str(pdf_path), max_images=max_images)
+
+    # 이미지 재번호 매기기
+    for i, img in enumerate(extraction.images):
+        img.index = i + 1
+
+    manifest = extraction.metadata.get("manifest", [])
+    print(f"  ✅ 텍스트: {len(extraction.full_text):,}자")
+    print(f"  ✅ Figure/Table 탐지: {len(manifest)}개 → 렌더링: {len(extraction.images)}페이지")
 
     if not extraction.full_text.strip():
         print("❌ PDF에서 텍스트를 추출할 수 없습니다. (스캔 PDF일 수 있음)")
         sys.exit(1)
 
     # Stage 2-4: 분석
-    analyzer = PaperAnalyzer(model=args.model, lang=args.lang, cache_dir=cache_dir)
+    analyzer = PaperAnalyzer(model=args.model, lang=args.lang)
 
     analyzer.analyze_text(extraction)
 
@@ -798,6 +777,7 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
     if result.synthesis:
         sections.append(result.synthesis)
     else:
+        # fallback: 텍스트 분석만
         sections.append("# 텍스트 분석 결과\n")
         sections.append(result.text_analysis)
 
@@ -806,8 +786,7 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
         sections.append("\n\n---\n")
         sections.append("# 부록: 개별 Figure/Table 분석 상세\n")
         for fa in result.figure_analyses:
-            fig_label = f"Figure {fa.get('figure_number', '')}" if fa.get('figure_number') else f"Image {fa['image_index']}"
-            sections.append(f"## {fig_label} (p.{fa['page']})")
+            sections.append(f"## Image {fa['image_index']} (p.{fa['page']})")
             if fa["caption"]:
                 sections.append(f"**Caption:** {fa['caption']}\n")
             sections.append(fa["analysis"])
@@ -815,11 +794,8 @@ def _build_output(result: AnalysisResult, extraction: ExtractionResult, args) ->
 
     # 토큰 사용량
     sections.append("\n---\n")
-    total_in = result.token_usage['input_tokens']
-    total_out = result.token_usage['output_tokens']
-    cost = _estimate_cost(result.model, total_in, total_out)
-    sections.append(f"*분석 토큰 사용량: 입력 {total_in:,} / 출력 {total_out:,} | "
-                    f"예상 비용: ~${cost:.3f}*")
+    sections.append(f"*분석 토큰 사용량: 입력 {result.token_usage['input_tokens']:,} / "
+                     f"출력 {result.token_usage['output_tokens']:,}*")
 
     return "\n".join(sections)
 
